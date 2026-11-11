@@ -1,0 +1,4 @@
+# .gitignore 파일 내용
+.env
+__pycache__/
+.streamlit/secrets.toml
