@@ -1,555 +1,766 @@
-# requirements: streamlit>=1.37, plotly>=5.18, pandas, numpy
-# 실행: streamlit run smart_city_dashboard.py
-#
-# 주의: 지도를 "클릭"해서 시설을 설치하는 기능은 streamlit의 on_select 이벤트를 사용합니다.
-# streamlit 버전이 낮으면(<=1.36) 클릭 설치가 동작하지 않을 수 있으니,
-# 그 경우 사이드바의 "좌표 직접 입력" 방식을 이용해 주세요.
+# -*- coding: utf-8 -*-
+"""
+🏙️ 실제 도시 인프라 과부하 분석 시뮬레이터 (Google Maps 기반)
 
+실행 방법
+---------
+1) 패키지 설치
+   pip install streamlit streamlit-folium folium googlemaps python-dotenv numpy pandas plotly
+2) API 키 설정 (둘 중 하나)
+   - 프로젝트 폴더의 .env 파일:        GOOGLE_MAPS_API_KEY=AIza...
+   - .streamlit/secrets.toml 파일:     GOOGLE_MAPS_API_KEY = "AIza..."
+3) 실행
+   streamlit run app.py
+
+필요한 Google Cloud API: Geocoding API, Places API (places_nearby = Legacy Places API)
+
+구조
+----
+ A. 상수 · 분석 엔진 (Streamlit 비의존: Haversine, 커버리지 감쇠, 구역별 부하율)
+ B. 페이지 설정 · API 키 로드 · Google API 래퍼 (캐싱 적용)
+ C. 세션 상태 · 콜백 (시설 추가/삭제/수정/검색)
+ D. 사이드바 UI
+ E. 지도/차트 생성 함수
+ F. 메인 대시보드
+"""
+from __future__ import annotations
+
+import os
+import time
+import uuid
+from html import escape
+
+import folium
+import googlemaps
 import numpy as np
 import pandas as pd
-import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
+from dotenv import load_dotenv
+from streamlit_folium import st_folium
 
 # ===========================================================
-# 0. 상수 & 기본 설정
+# A. 상수 · 분석 엔진 (UI와 독립적인 순수 계산 코드)
 # ===========================================================
-GRID_SIZE = 10
-ZONE_TYPES = ["주거 구역", "상업 구역", "공업 구역", "녹지 구역"]
-FACILITY_TYPES = ["경찰서", "병원", "회사"]
-GRADE_ORDER = ["양호", "주의", "위험", "심각"]
+EARTH_RADIUS_KM = 6371.0088          # 지구 평균 반지름 (km)
+KM_PER_DEG_LAT = 111.0               # 위도 1도 ≈ 111 km
+KM_PER_DEG_LNG_EQ = 111.32           # 적도 기준 경도 1도 ≈ 111.32 km (실제는 cos(위도)를 곱함)
+EPS = 1e-9                           # 0 나눗셈 방지용
+OI_CAP = 5.0                         # 부하율 표시 상한 (공급 0 → 상한값으로 처리)
 
-FACILITY_STYLE = {
-    "경찰서": {"color": "#3b82f6", "icon": "🚓"},
-    "병원":   {"color": "#ef4444", "icon": "🏥"},
-    "회사":   {"color": "#f59e0b", "icon": "🏢"},
+# 시설 유형별 기본 설정: Google Places type, 지도 색상, 기본 용량/반경, 기본 수요율
+FACILITY_TYPES = {
+    "경찰서": dict(place_type="police", color="blue", hex="#1f77b4", icon="flag",
+                 capacity=150, radius_km=2.5, demand_rate=0.04),
+    "병원": dict(place_type="hospital", color="red", hex="#d62728", icon="plus-sign",
+               capacity=200, radius_km=3.0, demand_rate=0.08),
+    "소방서": dict(place_type="fire_station", color="orange", hex="#ff7f0e", icon="fire",
+                capacity=120, radius_km=3.0, demand_rate=0.03),
 }
+DECAY_MODES = ["선형 감쇠", "가우시안 감쇠", "균등 (반경 내 전량)"]
+STATUS_COLORS = {"여유": "#2ca02c", "보통": "#f2c744", "과부하": "#ff7f0e", "심각": "#d62728"}
+FAC_COLUMNS = ["id", "name", "type", "lat", "lng", "capacity", "radius_km", "source"]
 
-# 눈이 편안한 부드러운 그라데이션 (진한 빨강 대신 연노랑 -> 연주황 -> 톤 다운된 빨강)
-SOFT_SCALE = [
-    [0.0, "#f8fafc"],
-    [0.30, "#fef3c7"],
-    [0.60, "#fdba74"],
-    [1.0, "#e07a5f"],
-]
 
-DEFAULT_FACILITIES = [
-    {"id": "f1", "name": "중앙 경찰서",   "type": "경찰서", "x": 2, "y": 3, "capacity": 150, "radius": 3.0},
-    {"id": "f2", "name": "동부 경찰서",   "type": "경찰서", "x": 8, "y": 7, "capacity": 100, "radius": 2.5},
-    {"id": "f3", "name": "IT 테크노밸리", "type": "회사",   "x": 5, "y": 5, "capacity": 200, "radius": 3.5},
-    {"id": "f4", "name": "시립 종합병원", "type": "병원",   "x": 3, "y": 8, "capacity": 180, "radius": 4.0},
-]
+def haversine_km(lat1, lon1, lat2, lon2):
+    """Haversine 공식: 두 위·경도 좌표 사이의 지표면 거리(km). 스칼라/numpy 배열 모두 지원."""
+    lat1, lon1, lat2, lon2 = map(np.radians, (lat1, lon1, lat2, lon2))
+    dlat, dlon = lat2 - lat1, lon2 - lon1
+    a = np.sin(dlat / 2.0) ** 2 + np.cos(lat1) * np.cos(lat2) * np.sin(dlon / 2.0) ** 2
+    return 2.0 * EARTH_RADIUS_KM * np.arcsin(np.sqrt(np.clip(a, 0.0, 1.0)))
 
-st.set_page_config(page_title="스마트 도시 인프라 시뮬레이터", page_icon="🏙️", layout="wide")
 
-st.markdown(
+def coverage_weight(dist_km, radius_km, mode):
+    """시설과의 거리에 따른 서비스 가중치(0~1). 커버리지 반경 밖이면 0."""
+    x = np.asarray(dist_km) / max(float(radius_km), 1e-6)
+    if mode == DECAY_MODES[0]:
+        w = 1.0 - x                       # 선형: 시설 위치 1.0 → 반경 경계 0.0
+    elif mode == DECAY_MODES[1]:
+        w = np.exp(-3.0 * x ** 2)         # 가우시안: 경계에서 약 0.05
+    else:
+        w = np.ones_like(x)               # 균등: 반경 안이면 전량 제공
+    return np.where(x <= 1.0, w, 0.0)
+
+
+def classify_array(oi, over, crit):
+    """부하율 → 상태 라벨. 여유 < 0.7×과부하기준 ≤ 보통 < 과부하기준 ≤ 과부하 < 심각기준 ≤ 심각"""
+    oi = np.asarray(oi, dtype=float)
+    return np.select([oi >= crit, oi >= over, oi >= 0.7 * over], ["심각", "과부하", "보통"], default="여유")
+
+
+def make_facility(ftype, name, lat, lng, capacity=None, radius_km=None, source="user", fid=None):
+    """시설 레코드(dict) 생성. 용량/반경을 생략하면 유형별 기본값을 사용."""
+    cfg = FACILITY_TYPES[ftype]
+    return {
+        "id": fid or f"user_{uuid.uuid4().hex[:8]}",
+        "name": name, "type": ftype,
+        "lat": float(lat), "lng": float(lng),
+        "capacity": int(capacity if capacity is not None else cfg["capacity"]),
+        "radius_km": float(radius_km if radius_km is not None else cfg["radius_km"]),
+        "source": source,
+    }
+
+
+def facilities_to_df(facs):
+    """시설 dict 리스트 → DataFrame (비어 있어도 컬럼 유지)."""
+    return pd.DataFrame(facs, columns=FAC_COLUMNS) if facs else pd.DataFrame(columns=FAC_COLUMNS)
+
+
+def analyze_zones(fac_df, center, p):
     """
-    <style>
-    .block-container { padding-top: 1.5rem; }
-    [data-testid="stMetric"] {
-        background: #ffffff; border: 1px solid #eef0f3; border-radius: 12px;
-        padding: 12px 16px 8px 16px; box-shadow: 0 1px 2px rgba(0,0,0,0.03);
-    }
-    [data-testid="stMetricLabel"] { font-size: 0.82rem; color: #6b7280; }
-    .badge {
-        display: inline-block; padding: 2px 10px; border-radius: 999px;
-        font-size: 0.78rem; font-weight: 600; color: white;
-    }
-    .cause-box {
-        background: #fafafa; border-left: 3px solid #e07a5f;
-        padding: 8px 12px; border-radius: 6px; margin-bottom: 6px; font-size: 0.92rem;
-    }
-    .facility-row {
-        display: flex; align-items: center; gap: 6px; padding: 5px 8px;
-        border-radius: 8px; border: 1px solid #f0f0f0; margin-bottom: 5px; font-size: 0.88rem;
-    }
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
+    분석 반경을 덮는 N×N 격자 구역별로 수요·공급·부하율(Overload Index)을 계산한다.
 
-st.title("🏙️ 스마트 도시 인프라 과부화 분석 · AI 추천 배치")
-st.caption("지도를 클릭해 신규 시설을 설치하고, 과부화 원인과 해결 방안을 자동으로 진단합니다.")
+      수요(구역, 유형)  = 추정인구 × 유형별 수요율
+      공급(구역, 유형)  = Σ 시설 용량 × 용량배율 × 거리감쇠가중치(Haversine 거리 / 커버리지 반경)
+      부하율 OI         = 수요 / 공급   (공급 0이면 OI_CAP, 1.0 초과면 수요가 공급을 넘는 상태)
+      종합 부하율        = 선택한 유형들의 OI 평균 또는 최댓값
+    ※ 실제 인구 통계가 없으므로 추정인구는 '도심 집중 + 잡음' 시뮬레이션 모델이다.
+    """
+    lat0, lng0, radius_km = center["lat"], center["lng"], center["radius_km"]
+    n = int(p["grid_n"])
 
+    # (1) 격자 생성: 중심에서 ±radius_km 범위를 n등분한 각 구역의 중심 좌표
+    step_km = 2.0 * radius_km / n
+    offsets_km = (np.arange(n) + 0.5) * step_km - radius_km
+    km_per_deg_lng = KM_PER_DEG_LNG_EQ * np.cos(np.radians(lat0))
+    lats = lat0 + offsets_km / KM_PER_DEG_LAT
+    lngs = lng0 + offsets_km / km_per_deg_lng
+    LAT, LNG = np.meshgrid(lats, lngs, indexing="ij")          # shape (n, n): [행=위도, 열=경도]
+    half_lat = step_km / 2.0 / KM_PER_DEG_LAT
+    half_lng = step_km / 2.0 / km_per_deg_lng
 
-def risk_level(value: float) -> tuple[str, str]:
-    if value >= 150:
-        return "심각", "#dc2626"
-    if value >= 100:
-        return "위험", "#f97316"
-    if value >= 70:
-        return "주의", "#eab308"
-    return "양호", "#16a34a"
-
-
-def badge_html(value: float) -> str:
-    label, color = risk_level(value)
-    return f'<span class="badge" style="background:{color}">{label} · {value:.0f}%</span>'
-
-
-# ===========================================================
-# 1. 기본 도시 격자 생성
-# ===========================================================
-@st.cache_data
-def generate_city_grid() -> pd.DataFrame:
-    rng = np.random.default_rng(42)
-    weights = [0.4, 0.3, 0.2, 0.1]
-    demand_ranges = {
-        "주거 구역": (60, 95), "상업 구역": (70, 100),
-        "공업 구역": (40, 80), "녹지 구역": (10, 30),
-    }
-    rows = []
-    for x in range(GRID_SIZE):
-        for y in range(GRID_SIZE):
-            zone = rng.choice(ZONE_TYPES, p=weights)
-            lo, hi = demand_ranges[zone]
-            rows.append({"x": x, "y": y, "zone": zone, "demand": int(rng.integers(lo, hi + 1))})
-    return pd.DataFrame(rows)
-
-
-city_df = generate_city_grid()
-CITY_AVG_DEMAND = float(city_df["demand"].mean())
-
-# ===========================================================
-# 2. 세션 상태
-# ===========================================================
-if "facilities" not in st.session_state:
-    st.session_state.facilities = [dict(f) for f in DEFAULT_FACILITIES]
-if "pending_click" not in st.session_state:
-    st.session_state.pending_click = None
-if "_id_counter" not in st.session_state:
-    st.session_state._id_counter = 1000
-
-
-def next_id() -> str:
-    st.session_state._id_counter += 1
-    return f"f{st.session_state._id_counter}"
-
-
-def add_facility(name, ftype, x, y, cap, rad):
-    st.session_state.facilities.append(
-        {"id": next_id(), "name": name, "type": ftype, "x": int(x), "y": int(y),
-         "capacity": int(cap), "radius": float(rad)}
-    )
-
-
-def remove_facilities(ids_to_remove: set):
-    st.session_state.facilities = [f for f in st.session_state.facilities if f["id"] not in ids_to_remove]
-
-
-def reset_facilities():
-    st.session_state.facilities = [dict(f) for f in DEFAULT_FACILITIES]
-    st.session_state.pending_click = None
-
-
-# ===========================================================
-# 3. 계산 엔진
-# ===========================================================
-def calculate_overload(grid_df: pd.DataFrame, facilities: list, selected_type: str = "전체"):
-    filtered = [f for f in facilities if selected_type == "전체" or f["type"] == selected_type]
-    xs, ys = np.arange(GRID_SIZE), np.arange(GRID_SIZE)
-    gx, gy = np.meshgrid(xs, ys)
-
-    supply_matrix = np.zeros((GRID_SIZE, GRID_SIZE))
-    for fac in filtered:
-        dist = np.sqrt((gx - fac["x"]) ** 2 + (gy - fac["y"]) ** 2)
-        supply_matrix += fac["capacity"] / (1.0 + (dist / fac["radius"]) ** 2)
-
-    result = grid_df.copy()
-    supply_vals = supply_matrix[result["y"].to_numpy(), result["x"].to_numpy()]
-    result["supply"] = np.round(supply_vals, 1)
-    result["overload_index"] = np.where(
-        supply_vals == 0, 200.0, np.round(result["demand"] / np.maximum(supply_vals, 1e-9) * 100.0, 1)
-    )
-    return result, filtered
-
-
-def recommend_best_location(grid_df: pd.DataFrame, facilities: list, selected_type: str) -> dict:
-    candidate_types = FACILITY_TYPES if selected_type == "전체" else [selected_type]
-    best = None
-    for t in candidate_types:
-        analyzed, _ = calculate_overload(grid_df, facilities, t)
-        top = analyzed.loc[analyzed["overload_index"].idxmax()]
-        candidate = {
-            "x": int(top["x"]), "y": int(top["y"]), "zone": top["zone"],
-            "overload_index": float(top["overload_index"]), "suggested_type": t,
-        }
-        if best is None or candidate["overload_index"] > best["overload_index"]:
-            best = candidate
-    return best
-
-
-def best_type_for_cell(grid_df: pd.DataFrame, facilities: list, x: int, y: int) -> str:
-    best_t, best_v = FACILITY_TYPES[0], -1
-    for t in FACILITY_TYPES:
-        analyzed, _ = calculate_overload(grid_df, facilities, t)
-        row = analyzed[(analyzed.x == x) & (analyzed.y == y)].iloc[0]
-        if row["overload_index"] > best_v:
-            best_v, best_t = row["overload_index"], t
-    return best_t
-
-
-# ===========================================================
-# 4. 진단(원인 분석 + 해결 방안) 엔진
-# ===========================================================
-def generate_diagnosis(grid_df: pd.DataFrame, facilities: list, x: int, y: int, ftype: str) -> dict:
-    analyzed, filtered = calculate_overload(grid_df, facilities, ftype)
-    row = analyzed[(analyzed.x == x) & (analyzed.y == y)].iloc[0]
-    demand, supply, overload, zone = row["demand"], row["supply"], row["overload_index"], row["zone"]
-
-    causes = []
-    if not filtered:
-        causes.append(f"도시 내에 **{ftype}** 유형의 시설이 하나도 없습니다. 이 유형에 대한 공급이 전무한 상태입니다.")
+    # (2) 추정 인구: 도심으로 갈수록 증가(가우시안) × 로그정규 잡음(시드 고정 → 재현 가능)
+    dist_c = haversine_km(lat0, lng0, LAT, LNG)
+    in_area = dist_c <= radius_km                              # 원형 분석 반경 밖 구역은 제외
+    sigma = max(radius_km * 0.5, 0.1)
+    if p["noise"] > 0:
+        noise = np.random.default_rng(int(p["seed"])).lognormal(0.0, p["noise"], size=(n, n))
     else:
-        dists = [(f, float(np.hypot(f["x"] - x, f["y"] - y))) for f in filtered]
-        nearest, nd = min(dists, key=lambda p: p[1])
-        if nd > nearest["radius"] * 1.3:
-            causes.append(
-                f"가장 가까운 {ftype}인 **'{nearest['name']}'**까지 거리가 {nd:.1f}칸으로, "
-                f"유효 서비스 반경({nearest['radius']:.1f}칸)을 크게 벗어나 사실상 사각지대입니다."
-            )
-        elif nd > nearest["radius"]:
-            causes.append(
-                f"가장 가까운 {ftype} **'{nearest['name']}'**가 서비스 반경 경계 부근"
-                f"({nd:.1f} / {nearest['radius']:.1f}칸)에 있어 공급 효율이 크게 떨어집니다."
-            )
+        noise = np.ones((n, n))
+    population = p["base_pop"] * (1.0 + p["conc"] * np.exp(-(dist_c / sigma) ** 2)) * noise
 
-    if demand >= CITY_AVG_DEMAND * 1.15:
-        pct = (demand / CITY_AVG_DEMAND - 1) * 100
-        causes.append(
-            f"이 구역({zone})의 기본 수요는 {demand:.0f}로, 도시 평균({CITY_AVG_DEMAND:.0f}) 대비 "
-            f"**{pct:.0f}% 높은 고밀도 지역**입니다."
-        )
+    # (3) 유형별 수요·공급·부하율
+    per_type = {}
+    for t in p["active"]:
+        demand = population * p["rates"][t]
+        supply = np.zeros((n, n))
+        scale = p["mult"].get(t, 100) / 100.0
+        for f in fac_df[fac_df["type"] == t].itertuples(index=False):
+            d = haversine_km(f.lat, f.lng, LAT, LNG)           # 시설 → 모든 구역 거리(km)
+            supply += f.capacity * scale * coverage_weight(d, f.radius_km, p["decay"])
+        oi = np.minimum(demand / np.maximum(supply, EPS), OI_CAP)
+        per_type[t] = (demand, supply, oi)
 
-    if supply > 0 and overload >= 100:
-        causes.append(f"주변 시설의 유효 공급량({supply:.0f})이 수요({demand:.0f})를 따라가지 못해 **공급 부족**이 발생했습니다.")
+    # (4) 종합 지표 및 사각지대(어느 한 유형이라도 공급 0인 구역)
+    stack = np.stack([v[2] for v in per_type.values()])
+    oi_total = stack.max(axis=0) if p["agg"] == "max" else stack.mean(axis=0)
+    uncovered = np.any(np.stack([v[1] < 1e-6 for v in per_type.values()]), axis=0)
 
-    if not causes:
-        causes.append("현재 이 구역은 뚜렷한 과부화 원인이 발견되지 않았습니다. 대체로 양호한 상태입니다.")
-
-    # 해결 방안 시뮬레이션: 이 위치에 신규 시설을 놓았을 때 예측
-    existing_of_type = [f for f in filtered]
-    suggested_capacity = int(np.mean([f["capacity"] for f in existing_of_type])) if existing_of_type else 150
-    suggested_radius = round(float(np.mean([f["radius"] for f in existing_of_type])), 1) if existing_of_type else 3.0
-
-    sim_facs = facilities + [{
-        "id": "sim-preview", "name": f"신규 {ftype}", "type": ftype,
-        "x": x, "y": y, "capacity": suggested_capacity, "radius": suggested_radius,
-    }]
-    sim_analyzed, _ = calculate_overload(grid_df, sim_facs, ftype)
-    after_val = float(sim_analyzed[(sim_analyzed.x == x) & (sim_analyzed.y == y)].iloc[0]["overload_index"])
-
-    if overload >= 70:
-        solution_text = (
-            f"이 위치에 용량 {suggested_capacity}, 반경 {suggested_radius}칸 수준의 신규 **{ftype}**를 배치하면 "
-            f"예상 부하율이 **{overload:.0f}% → {after_val:.0f}%** 로 낮아질 것으로 예측됩니다."
-        )
-    else:
-        solution_text = "현재 부하율이 양호한 수준이라 즉시 신규 시설 배치가 시급하지는 않습니다. 다른 고위험 지역을 먼저 검토해 보세요."
+    rows, cols = np.where(in_area)
+    data = {
+        "구역": [f"R{r + 1:02d}-C{c + 1:02d}" for r, c in zip(rows, cols)],
+        "행": rows, "열": cols,
+        "위도": LAT[in_area], "경도": LNG[in_area],
+        "중심거리(km)": dist_c[in_area], "추정인구": population[in_area],
+    }
+    for t, (demand, supply, oi) in per_type.items():
+        data[f"수요_{t}"] = demand[in_area]
+        data[f"공급_{t}"] = supply[in_area]
+        data[f"부하율_{t}"] = oi[in_area]
+    data["종합 부하율"] = oi_total[in_area]
+    data["사각지대"] = uncovered[in_area]
 
     return {
-        "demand": demand, "supply": supply, "overload": overload, "zone": zone,
-        "causes": causes, "solution_text": solution_text,
-        "suggested_capacity": suggested_capacity, "suggested_radius": suggested_radius,
-        "predicted_after": after_val,
+        "df": pd.DataFrame(data),
+        "active": list(p["active"]),
+        "grid": {"n": n, "lats": lats, "lngs": lngs, "half_lat": half_lat, "half_lng": half_lng},
     }
 
 
-def get_top_hotspots(analyzed_df: pd.DataFrame, exclude_xy: tuple, n: int = 3) -> list:
-    df = analyzed_df[~((analyzed_df.x == exclude_xy[0]) & (analyzed_df.y == exclude_xy[1]))]
-    df = df.sort_values("overload_index", ascending=False).head(n)
-    return df.to_dict("records")
-
-
 # ===========================================================
-# 5. 사이드바
+# B. 페이지 설정 · API 키 · Google API 래퍼
 # ===========================================================
-st.sidebar.header("⚙️ 설정")
-
-facility_type_filter = st.sidebar.selectbox("분석할 인프라 유형", ["전체"] + FACILITY_TYPES)
-
-st.sidebar.markdown("**🔥 부하율 표시**")
-show_heatmap = st.sidebar.toggle("히트맵 켜기", value=True)
-selected_grades = st.sidebar.multiselect(
-    "표시할 위험 등급만 필터", GRADE_ORDER, default=GRADE_ORDER,
-    help="선택하지 않은 등급의 셀은 지도에서 흐리게 숨겨집니다.", disabled=not show_heatmap,
-)
-
-st.sidebar.markdown("---")
-st.sidebar.subheader("📋 등록된 시설")
-if not st.session_state.facilities:
-    st.sidebar.info("등록된 시설이 없습니다.")
-else:
-    for f in st.session_state.facilities:
-        s = FACILITY_STYLE[f["type"]]
-        st.sidebar.markdown(
-            f'<div class="facility-row">{s["icon"]} <b>{f["name"]}</b>'
-            f'<span style="color:#9ca3af">&nbsp;({f["x"]},{f["y"]} · 용량{f["capacity"]})</span></div>',
-            unsafe_allow_html=True,
-        )
-    del_map = {f'{FACILITY_STYLE[f["type"]]["icon"]} {f["name"]}': f["id"] for f in st.session_state.facilities}
-    to_del = st.sidebar.multiselect("삭제할 시설", list(del_map.keys()))
-    c1, c2 = st.sidebar.columns(2)
-    if c1.button("🗑️ 삭제", use_container_width=True, disabled=not to_del):
-        remove_facilities({del_map[k] for k in to_del})
-        st.rerun()
-    if c2.button("↺ 초기화", use_container_width=True):
-        reset_facilities()
-        st.rerun()
-
-st.sidebar.markdown("---")
-with st.sidebar.expander("🔧 좌표 직접 입력으로 설치 (클릭이 안 될 때)"):
-    with st.form("manual_add_form", clear_on_submit=True):
-        m_name = st.text_input("시설 이름", "")
-        m_type = st.selectbox("시설 유형", FACILITY_TYPES, key="manual_type")
-        mc1, mc2 = st.columns(2)
-        m_x = mc1.number_input("X", 0, GRID_SIZE - 1, 5)
-        m_y = mc2.number_input("Y", 0, GRID_SIZE - 1, 5)
-        m_cap = st.number_input("수용 용량", 50, 500, 120, step=10)
-        m_rad = st.slider("커버리지 반경", 1.0, 5.0, 3.0, step=0.5)
-        if st.form_submit_button("설치", use_container_width=True):
-            if not m_name.strip():
-                st.error("시설 이름을 입력해 주세요.")
-            else:
-                add_facility(m_name.strip(), m_type, m_x, m_y, m_cap, m_rad)
-                st.success(f"'{m_name}' 설치 완료!")
-                st.rerun()
-
-# ===========================================================
-# 6. 계산 실행
-# ===========================================================
-analyzed_df, active_facs = calculate_overload(city_df, st.session_state.facilities, facility_type_filter)
-rec_location = recommend_best_location(city_df, st.session_state.facilities, facility_type_filter)
-
-avg_overload = analyzed_df["overload_index"].mean()
-max_overload = analyzed_df["overload_index"].max()
-high_risk_count = int((analyzed_df["overload_index"] >= 100).sum())
-
-m1, m2, m3, m4 = st.columns(4)
-m1.metric("도시 평균 부하율", f"{avg_overload:.1f}%")
-m2.metric("최대 부하 구역", f"{max_overload:.1f}%")
-m3.metric("위험 이상 구역 수", f"{high_risk_count} / {GRID_SIZE * GRID_SIZE} 개")
-m4.metric("AI 추천 신설 위치", f"({rec_location['x']}, {rec_location['y']})",
-          f"{FACILITY_STYLE[rec_location['suggested_type']]['icon']} {rec_location['suggested_type']}")
-
-st.markdown("---")
-tab1, tab2, tab3 = st.tabs(["🗺️ 지도 · 클릭 설치", "🤖 AI 진단 & 추천", "📋 상세 데이터"])
+# 주의: st.set_page_config()는 첫 번째 Streamlit 명령이어야 한다.
+st.set_page_config(page_title="실제 도시 인프라 과부하 분석 시뮬레이터", page_icon="🏙️", layout="wide")
+ss = st.session_state
 
 
-def to_grid(df: pd.DataFrame, col: str) -> np.ndarray:
-    z = np.zeros((GRID_SIZE, GRID_SIZE))
-    z[df["y"].to_numpy(), df["x"].to_numpy()] = df[col].to_numpy()
-    return z
+def load_api_key():
+    """.env(python-dotenv) 또는 st.secrets에서 GOOGLE_MAPS_API_KEY를 읽는다."""
+    load_dotenv()
+    key = None
+    try:
+        key = st.secrets.get("GOOGLE_MAPS_API_KEY")    # secrets.toml이 없으면 예외 → 무시
+    except Exception:
+        key = None
+    if not key:
+        key = os.getenv("GOOGLE_MAPS_API_KEY")
+    return str(key).strip() if key else None
 
 
-def build_map_figure(z_data, active_facs, show_heatmap, selected_grades, pending_click):
-    fig = go.Figure()
+API_KEY = load_api_key()
+if not API_KEY:
+    st.error("🔑 Google Maps API Key를 찾을 수 없습니다. `.env` 파일(GOOGLE_MAPS_API_KEY=...) 또는 "
+             "`.streamlit/secrets.toml`을 확인해 주세요.")
+    st.stop()
 
-    if show_heatmap:
-        vgrade = np.vectorize(lambda v: risk_level(v)[0])
-        grades_grid = vgrade(z_data)
-        mask = np.isin(grades_grid, selected_grades) if selected_grades else np.zeros_like(z_data, dtype=bool)
-        z_display = np.where(mask, z_data, np.nan)
-        zmax = max(120.0, float(np.nanpercentile(z_data, 95)) if z_data.size else 120.0)
-        fig.add_trace(go.Heatmap(
-            z=z_display, x=list(range(GRID_SIZE)), y=list(range(GRID_SIZE)),
-            colorscale=SOFT_SCALE, zmin=0, zmax=zmax,
-            colorbar=dict(title="부하율(%)"),
-            hovertemplate="X:%{x} Y:%{y}<br>부하율 %{z:.0f}%<extra></extra>",
-            xgap=2, ygap=2,
-        ))
-    else:
-        # 눈이 편한 옅은 배경만 표시 (시설 배치에 집중)
-        fig.add_trace(go.Heatmap(
-            z=np.zeros_like(z_data), x=list(range(GRID_SIZE)), y=list(range(GRID_SIZE)),
-            colorscale=[[0, "#f8fafc"], [1, "#f8fafc"]], showscale=False,
-            hoverinfo="skip", xgap=2, ygap=2,
-        ))
 
-    for ftype in FACILITY_TYPES:
-        subset = [f for f in active_facs if f["type"] == ftype]
-        if not subset:
+def mask_secret(err) -> str:
+    """오류 메시지(URL 등)에 API 키가 섞여 화면에 노출되는 것을 방지."""
+    return str(err).replace(API_KEY, "***")
+
+
+@st.cache_resource
+def get_gmaps_client(api_key: str):
+    """googlemaps 클라이언트는 한 번만 만들어 재사용."""
+    return googlemaps.Client(key=api_key)
+
+
+try:
+    get_gmaps_client(API_KEY)
+except Exception as e:  # 예: 키 형식 오류(ValueError)
+    st.error(f"Google Maps 클라이언트 초기화 실패: {mask_secret(e)}")
+    st.stop()
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def geocode_address(query: str):
+    """Geocoding API: 지역명 → 위·경도 (24시간 캐시). 결과가 없으면 None."""
+    res = get_gmaps_client(API_KEY).geocode(query, language="ko", region="kr")
+    if not res:
+        return None
+    loc = res[0]["geometry"]["location"]
+    return {"lat": loc["lat"], "lng": loc["lng"], "address": res[0].get("formatted_address", query)}
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def reverse_geocode_cached(lat: float, lng: float):
+    """Reverse Geocoding: 위·경도 → 주소 (24시간 캐시)."""
+    res = get_gmaps_client(API_KEY).reverse_geocode((lat, lng), language="ko")
+    return res[0].get("formatted_address") if res else None
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_places_by_type(lat: float, lng: float, radius_m: int, place_type: str, max_pages: int):
+    """
+    Places Nearby Search를 유형 1개에 대해 호출 (1시간 캐시로 API 비용 절감).
+    실패 시 예외를 그대로 올린다 → 오류 결과는 캐시되지 않는다.
+    """
+    client = get_gmaps_client(API_KEY)
+    places, token = [], None
+    for _ in range(max_pages):
+        resp = None
+        for attempt in range(4):
+            try:
+                if token:
+                    resp = client.places_nearby(page_token=token)
+                else:
+                    resp = client.places_nearby(location=(lat, lng), radius=radius_m,
+                                                type=place_type, language="ko")
+                break
+            except googlemaps.exceptions.ApiError as e:
+                # next_page_token은 발급 직후 잠시 유효하지 않을 수 있어 재시도
+                if token and "INVALID_REQUEST" in str(e) and attempt < 3:
+                    time.sleep(2)
+                    continue
+                raise
+        for p in resp.get("results", []):
+            if p.get("business_status") == "CLOSED_PERMANENTLY":
+                continue                                    # 폐업 시설 제외
+            loc = p["geometry"]["location"]
+            places.append({"place_id": p.get("place_id"), "name": p.get("name", "이름 없음"),
+                           "lat": loc["lat"], "lng": loc["lng"]})
+        token = resp.get("next_page_token")
+        if not token:
+            break
+        time.sleep(2)                                       # 다음 페이지 토큰 활성화 대기
+    return places
+
+
+def collect_facilities(lat, lng, radius_m, type_names, max_pages):
+    """선택한 유형별로 주변 시설을 수집. (시설 리스트, 오류 메시지 리스트) 반환."""
+    facilities, errors, seen = [], [], set()
+    for tname in type_names:
+        cfg = FACILITY_TYPES[tname]
+        try:
+            places = fetch_places_by_type(round(lat, 5), round(lng, 5), int(radius_m),
+                                          cfg["place_type"], int(max_pages))
+        except Exception as e:
+            errors.append(f"{tname} 수집 실패: {mask_secret(e)}")
             continue
-        style = FACILITY_STYLE[ftype]
-        fig.add_trace(go.Scatter(
-            x=[f["x"] for f in subset], y=[f["y"] for f in subset],
-            mode="markers+text",
-            marker=dict(symbol="square", size=15, color=style["color"], line=dict(width=1.5, color="white")),
-            text=[f["name"] for f in subset], textposition="top center",
-            name=f'{style["icon"]} {ftype}',
-            hovertext=[f"{f['name']} · 용량 {f['capacity']} · 반경 {f['radius']}" for f in subset],
-            hoverinfo="text",
-        ))
+        for p in places:
+            key = (p["place_id"], tname)
+            if key in seen:
+                continue
+            seen.add(key)
+            facilities.append(make_facility(tname, p["name"], p["lat"], p["lng"],
+                                            source="google", fid=f"{p['place_id']}|{tname}"))
+    return facilities, errors
 
-    if pending_click is not None:
-        fig.add_trace(go.Scatter(
-            x=[pending_click[0]], y=[pending_click[1]], mode="markers",
-            marker=dict(symbol="circle-open", size=26, color="#111827", line=dict(width=3)),
-            name="선택된 위치", showlegend=False, hoverinfo="skip",
-        ))
 
-    fig.update_layout(
-        xaxis=dict(title="X 좌표 (동-서)", dtick=1, showgrid=False),
-        yaxis=dict(title="Y 좌표 (남-북)", dtick=1, showgrid=False),
-        plot_bgcolor="white", paper_bgcolor="white",
-        height=560, margin=dict(l=20, r=20, t=30, b=20),
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-    )
+# ===========================================================
+# C. 세션 상태 · 콜백
+# ===========================================================
+def init_state():
+    ss.setdefault("center", {"lat": 37.5665, "lng": 126.9780, "label": "서울시청",
+                             "address": None, "radius_km": 3.0})
+    ss.setdefault("facilities", [])          # 현재(편집 중) 시설
+    ss.setdefault("facilities_base", [])     # 수집 직후 원본 (비교/초기화용)
+    ss.setdefault("loaded", False)           # 한 번이라도 시설을 수집했는지
+    ss.setdefault("view_center", [37.5665, 126.9780])
+    ss.setdefault("view_zoom", 13)
+    ss.setdefault("clicked", None)           # 마지막 지도 클릭 좌표
+    ss.setdefault("last_raw_click", None)
+
+
+def flash(level: str, msg: str):
+    """rerun 이후에도 보이도록 메시지를 세션에 저장 (level: success/info/warning/error)."""
+    ss.setdefault("flash", []).append((level, msg))
+
+
+def show_flash():
+    for level, msg in ss.pop("flash", []):
+        getattr(st, level)(msg)
+
+
+def zoom_for_radius(radius_km: float) -> int:
+    return 14 if radius_km <= 1.5 else 13 if radius_km <= 3.5 else 12
+
+
+def center_key(c) -> str:
+    return f"{c['lat']:.4f}_{c['lng']:.4f}"
+
+
+def process_pending_search():
+    """
+    검색/지도클릭 버튼이 예약한 요청을 위젯 생성 '이전'에 처리한다.
+    (위젯 생성 후에는 해당 위젯의 session_state 키를 수정할 수 없기 때문)
+    """
+    req = ss.pop("pending_search", None)
+    if not req:
+        return
+    types = ss.get("search_types") or []
+    if not types:
+        flash("warning", "수집할 시설 유형을 하나 이상 선택해 주세요.")
+        return
+    radius_m = int(ss.get("search_radius_m", 3000))
+    max_pages = int(ss.get("search_pages", 1))
+
+    with st.spinner("Google Maps에서 위치와 주변 시설을 조회하는 중..."):
+        # (1) 중심 좌표 결정
+        if req["mode"] == "query":
+            query = req["query"].strip()
+            if not query:
+                flash("warning", "검색할 지역명을 입력해 주세요.")
+                return
+            try:
+                geo = geocode_address(query)
+            except Exception as e:
+                flash("error", f"Geocoding 오류: {mask_secret(e)}")
+                return
+            if not geo:
+                flash("error", f"'{query}'에 해당하는 위치를 찾지 못했습니다.")
+                return
+            lat, lng, label, address = geo["lat"], geo["lng"], query, geo["address"]
+        else:  # 지도 클릭 지점
+            lat, lng = req["lat"], req["lng"]
+            try:
+                address = reverse_geocode_cached(round(lat, 5), round(lng, 5))
+            except Exception:
+                address = None
+            label = address or f"지도 클릭 ({lat:.4f}, {lng:.4f})"
+
+        # (2) 주변 시설 수집
+        facs, errors = collect_facilities(lat, lng, radius_m, types, max_pages)
+
+    for msg in errors:
+        flash("warning", msg)
+    if not facs and errors:
+        flash("error", "시설을 수집하지 못해 기존 데이터를 유지합니다. (API 활성화/결제/키 제한을 확인하세요)")
+        return
+
+    ss["center"] = {"lat": lat, "lng": lng, "label": label, "address": address, "radius_km": radius_m / 1000}
+    ss["view_center"], ss["view_zoom"] = [lat, lng], zoom_for_radius(radius_m / 1000)
+    ss["facilities"] = [dict(f) for f in facs]
+    ss["facilities_base"] = [dict(f) for f in facs]
+    ss["loaded"], ss["clicked"] = True, None
+    ss["skip_view_sync"] = True                 # 새 중심으로 이동한 직후엔 이전 지도 뷰 값을 덮어쓰지 않음
+    for k in ("del_ids", "edit_id"):            # 사라진 시설을 가리키는 위젯 상태 정리
+        ss.pop(k, None)
+    counts = ", ".join(f"{t} {sum(1 for f in facs if f['type'] == t)}곳" for t in types)
+    flash("success", f"'{label}' 반경 {radius_m / 1000:.1f}km 수집 완료 → 총 {len(facs)}곳 ({counts})")
+    if not facs:
+        flash("warning", "검색 결과가 0건입니다. 반경을 넓히거나 다른 지역을 검색해 보세요.")
+
+
+def cb_search_query():
+    ss["pending_search"] = {"mode": "query", "query": ss.get("search_query", "")}
+
+
+def cb_search_click():
+    clk = ss.get("clicked")
+    if clk:
+        ss["pending_search"] = {"mode": "click", "lat": clk["lat"], "lng": clk["lng"]}
+
+
+def cb_add_facility():
+    """사이드바 '시설 추가' 버튼 콜백."""
+    t = ss["add_type"]
+    c = ss["center"]
+    mode = ss.get("add_pos_mode", "분석 중심")
+    if mode == "분석 중심":
+        lat, lng = c["lat"], c["lng"]
+    elif mode == "마지막 지도 클릭 지점":
+        clk = ss.get("clicked")
+        if not clk:
+            flash("warning", "먼저 지도에서 위치를 클릭해 주세요.")
+            return
+        lat, lng = clk["lat"], clk["lng"]
+    else:
+        ck = center_key(c)
+        lat, lng = ss[f"add_lat_{ck}"], ss[f"add_lng_{ck}"]
+    n_user = sum(1 for f in ss["facilities"] if f["source"] == "user") + 1
+    name = (ss.get("add_name") or "").strip() or f"[추가] {t} {n_user}"
+    ss["facilities"].append(make_facility(t, name, lat, lng, ss[f"add_cap_{t}"], ss[f"add_rad_{t}"]))
+    flash("success", f"'{name}' 시설을 ({lat:.5f}, {lng:.5f})에 추가했습니다.")
+
+
+def cb_delete_facilities():
+    ids = set(ss.get("del_ids", []))
+    ss["facilities"] = [f for f in ss["facilities"] if f["id"] not in ids]
+    ss["del_ids"] = []
+    ss.pop("edit_id", None)
+    flash("success", f"{len(ids)}개 시설을 삭제했습니다.")
+
+
+def cb_edit_facility(fid: str):
+    for f in ss["facilities"]:
+        if f["id"] == fid:
+            f["capacity"] = int(ss[f"edit_cap_{fid}"])
+            f["radius_km"] = float(ss[f"edit_rad_{fid}"])
+            flash("success", f"'{f['name']}' 용량/반경을 수정했습니다.")
+            return
+
+
+def cb_reset_facilities():
+    ss["facilities"] = [dict(f) for f in ss["facilities_base"]]
+    for k in ("del_ids", "edit_id"):
+        ss.pop(k, None)
+    for t in FACILITY_TYPES:
+        ss[f"mult_{t}"] = 100
+    flash("info", "시설 목록과 용량 배율을 수집 직후 상태로 되돌렸습니다.")
+
+
+# ===========================================================
+# D. 사이드바 UI
+# ===========================================================
+init_state()
+process_pending_search()
+
+with st.sidebar:
+    st.title("🎛️ 컨트롤 패널")
+
+    # ---- 1. 위치 검색 · 데이터 수집 ----
+    with st.expander("📍 1. 위치 검색 · 시설 수집", expanded=True):
+        st.text_input("도시/지역명 (예: 서울시청, 강남역)", value="서울시청", key="search_query")
+        st.slider("시설 검색 반경 (m)", 500, 5000, 3000, 100, key="search_radius_m")
+        st.multiselect("수집할 시설 유형", list(FACILITY_TYPES), default=list(FACILITY_TYPES), key="search_types")
+        st.slider("유형별 수집 페이지 수 (페이지당 최대 20곳)", 1, 3, 1, key="search_pages",
+                  help="페이지를 늘릴수록 더 많은 시설을 수집하지만 API 호출(비용)과 대기 시간이 늘어납니다.")
+        st.button("🔍 검색 및 시설 수집", type="primary", on_click=cb_search_query)
+
+    facilities = ss["facilities"]
+    fac_label = {f["id"]: f"{f['name']} ({f['type']})" for f in facilities}
+    center = ss["center"]
+
+    # ---- 2. 시설 관리 ----
+    with st.expander("🏗️ 2. 시설 관리 (추가 · 삭제 · 용량 조정)"):
+        tab_add, tab_del, tab_cap = st.tabs(["➕ 추가", "🗑️ 삭제", "🔧 용량"])
+
+        with tab_add:
+            add_type = st.selectbox("시설 유형", list(FACILITY_TYPES), key="add_type")
+            acfg = FACILITY_TYPES[add_type]
+            st.text_input("시설명 (비우면 자동 생성)", key="add_name")
+            # 유형별로 위젯 key를 분리해 유형을 바꾸면 해당 유형의 기본값이 나타나도록 함
+            st.number_input("수용 용량", 10, 5000, int(acfg["capacity"]), 10, key=f"add_cap_{add_type}")
+            st.number_input("커버리지 반경 (km)", 0.5, 10.0, float(acfg["radius_km"]), 0.5, key=f"add_rad_{add_type}")
+            pos_mode = st.radio("추가 위치", ["분석 중심", "마지막 지도 클릭 지점", "직접 입력"], key="add_pos_mode")
+            if pos_mode == "직접 입력":
+                ck = center_key(center)
+                st.number_input("위도", -90.0, 90.0, float(center["lat"]), 0.001, format="%.5f", key=f"add_lat_{ck}")
+                st.number_input("경도", -180.0, 180.0, float(center["lng"]), 0.001, format="%.5f", key=f"add_lng_{ck}")
+            elif pos_mode == "마지막 지도 클릭 지점":
+                clk = ss.get("clicked")
+                st.caption(f"클릭 좌표: {clk['lat']:.5f}, {clk['lng']:.5f}" if clk else "지도를 클릭하면 좌표가 저장됩니다.")
+            st.button("시설 추가", on_click=cb_add_facility, disabled=not ss["loaded"])
+
+        with tab_del:
+            if facilities:
+                sel = st.multiselect("삭제할 시설", list(fac_label), format_func=fac_label.get, key="del_ids")
+                st.button("선택 시설 삭제", on_click=cb_delete_facilities, disabled=not sel)
+            else:
+                st.caption("삭제할 시설이 없습니다.")
+
+        with tab_cap:
+            st.markdown("**유형별 수용 용량 배율 (%)**")
+            mult = {t: st.slider(t, 20, 300, 100, 5, key=f"mult_{t}") for t in FACILITY_TYPES}
+            st.markdown("**개별 시설 수정**")
+            if facilities:
+                fid = st.selectbox("시설 선택", list(fac_label), format_func=fac_label.get, key="edit_id")
+                cur = next(f for f in facilities if f["id"] == fid)
+                st.number_input("수용 용량", 10, 5000, int(cur["capacity"]), 10, key=f"edit_cap_{fid}")
+                st.number_input("커버리지 반경 (km)", 0.5, 10.0, float(cur["radius_km"]), 0.5, key=f"edit_rad_{fid}")
+                st.button("수정 적용", on_click=cb_edit_facility, args=(fid,))
+            else:
+                st.caption("수정할 시설이 없습니다.")
+            st.button("↩️ 수집 직후 상태로 초기화", on_click=cb_reset_facilities, disabled=not ss["loaded"])
+
+    # ---- 3. 분석 기준 ----
+    with st.expander("⚙️ 3. 분석 기준"):
+        active_types = st.multiselect("분석 대상 시설 유형", list(FACILITY_TYPES),
+                                      default=list(FACILITY_TYPES), key="active_types")
+        grid_n = st.slider("격자 해상도 (N×N 구역)", 5, 20, 10)
+        decay = st.selectbox("커버리지 감쇠 방식", DECAY_MODES)
+        agg = st.radio("종합 부하율 산출", ["mean", "max"], horizontal=True,
+                       format_func=lambda x: "평균" if x == "mean" else "최댓값 (가장 취약한 서비스)")
+        base_pop = st.number_input("구역당 기본 추정 인구 (명)", 500, 50000, 5000, 500)
+        conc = st.slider("도심 집중도", 0.0, 4.0, 1.5, 0.1, help="0이면 모든 구역 인구가 균일, 클수록 중심부에 집중")
+        noise_sigma = st.slider("수요 변동성 (잡음)", 0.0, 0.6, 0.2, 0.05)
+        seed = st.number_input("난수 시드", 0, 9999, 42)
+        st.markdown("**유형별 수요율 (인구 대비)**")
+        rates = {t: st.slider(t, 0.0, 0.30, float(FACILITY_TYPES[t]["demand_rate"]), 0.005,
+                              format="%.3f", key=f"rate_{t}") for t in FACILITY_TYPES}
+        over_thr = st.slider("과부하 기준 (부하율 ≥)", 0.5, 2.0, 1.0, 0.05)
+        crit_thr = max(st.slider("심각 기준 (부하율 ≥)", 1.0, 4.0, 1.5, 0.05), over_thr + 0.1)
+
+    # ---- 4. 지도 표시 ----
+    with st.expander("🗺️ 4. 지도 표시"):
+        view_options = ["종합"] + list(active_types)
+        if ss.get("view_metric") not in view_options:
+            ss.pop("view_metric", None)
+        view_metric = st.selectbox("지도에 표시할 지표", view_options, key="view_metric")
+        tile_choice = st.radio("지도 타일", ["Google Maps", "OpenStreetMap"], horizontal=True)
+        show_zones = st.checkbox("구역별 부하율 오버레이", True)
+        show_cover = st.checkbox("시설 커버리지 반경 표시", False)
+
+
+# ===========================================================
+# E. 지도 · 차트 생성 함수
+# ===========================================================
+def build_map(center, facilities, result, view_col, view_label, over, crit,
+              tile_choice, show_zones, show_cover, clicked):
+    """Folium 지도 생성: 타일 → 부하율 구역 → 분석 반경 → 시설 마커 → 클릭 지점."""
+    m = folium.Map(location=ss["view_center"], zoom_start=ss["view_zoom"], tiles=None, control_scale=True)
+    if tile_choice == "Google Maps":
+        folium.TileLayer(
+            tiles=f"https://mt1.google.com/vt/lyrs=m&hl=ko&x={{x}}&y={{y}}&z={{z}}&key={API_KEY}",
+            attr="Google Maps", name="Google Maps", max_zoom=20).add_to(m)
+    else:
+        folium.TileLayer("OpenStreetMap").add_to(m)
+
+    # 구역별 부하율 오버레이 (색상 = 상태)
+    if show_zones and result is not None:
+        g = result["grid"]
+        df = result["df"]
+        statuses = classify_array(df[view_col], over, crit)
+        for r, status in zip(df.to_dict("records"), statuses):
+            color = STATUS_COLORS[status]
+            lines = [f"<b>{r['구역']}</b>", f"{view_label} 부하율: <b>{r[view_col]:.2f}</b> ({status})",
+                     f"추정 인구: {r['추정인구']:,.0f}명"]
+            lines += [f"{t}: 수요 {r[f'수요_{t}']:.0f} / 공급 {r[f'공급_{t}']:.0f}" for t in result["active"]]
+            folium.Rectangle(
+                bounds=[[r["위도"] - g["half_lat"], r["경도"] - g["half_lng"]],
+                        [r["위도"] + g["half_lat"], r["경도"] + g["half_lng"]]],
+                color=color, weight=1, fill=True, fill_color=color, fill_opacity=0.35,
+                tooltip=folium.Tooltip("<br>".join(lines)),
+            ).add_to(m)
+
+    # 분석 반경 + 중심점
+    folium.Circle([center["lat"], center["lng"]], radius=center["radius_km"] * 1000, color="#444",
+                  weight=1.5, dash_array="6", fill=False).add_to(m)
+    folium.CircleMarker([center["lat"], center["lng"]], radius=6, color="black", fill=True,
+                        fill_opacity=1, tooltip="분석 중심").add_to(m)
+
+    # 시설 마커 (경찰서 파랑 / 병원 빨강 / 소방서 주황)
+    for f in facilities:
+        cfg = FACILITY_TYPES[f["type"]]
+        origin = "사용자 추가" if f["source"] == "user" else "Google Places"
+        popup = (f"<b>{escape(f['name'])}</b> ({f['type']})<br>용량 {f['capacity']} · 반경 {f['radius_km']:.1f}km"
+                 f"<br><small>{origin}</small>")
+        folium.Marker([f["lat"], f["lng"]], popup=folium.Popup(popup, max_width=260),
+                      tooltip=f"{f['name']} ({f['type']})",
+                      icon=folium.Icon(color=cfg["color"], icon=cfg["icon"])).add_to(m)
+        if show_cover:
+            folium.Circle([f["lat"], f["lng"]], radius=f["radius_km"] * 1000, color=cfg["hex"],
+                          weight=1, fill=True, fill_opacity=0.04).add_to(m)
+
+    # 마지막 클릭 지점
+    if clicked:
+        folium.Marker([clicked["lat"], clicked["lng"]], tooltip="클릭한 지점",
+                      icon=folium.Icon(color="purple", icon="screenshot")).add_to(m)
+    return m
+
+
+def build_heatmap(result, view_col, view_label, facilities, over, crit):
+    """Plotly 히트맵: 부하율 격자 + 시설 위치 (색상 구간은 상태 기준과 동일)."""
+    g, df = result["grid"], result["df"]
+    z = np.full((g["n"], g["n"]), np.nan)                 # 분석 반경 밖 구역은 NaN(빈칸)
+    z[df["행"].to_numpy(), df["열"].to_numpy()] = df[view_col].to_numpy()
+    zmax = float(max(crit * 1.5, np.nanmax(z)))
+    low = 0.7 * over
+    c = STATUS_COLORS
+    scale = [[0, c["여유"]], [low / zmax, c["여유"]], [low / zmax, c["보통"]], [over / zmax, c["보통"]],
+             [over / zmax, c["과부하"]], [crit / zmax, c["과부하"]], [crit / zmax, c["심각"]], [1, c["심각"]]]
+    fig = go.Figure(go.Heatmap(
+        z=z, x=np.round(g["lngs"], 5), y=np.round(g["lats"], 5), colorscale=scale, zmin=0, zmax=zmax,
+        colorbar=dict(title="부하율"), hovertemplate="경도 %{x}<br>위도 %{y}<br>부하율 %{z:.2f}<extra></extra>"))
+    for t, cfg in FACILITY_TYPES.items():
+        sub = [f for f in facilities if f["type"] == t]
+        if sub:
+            fig.add_trace(go.Scatter(
+                x=[f["lng"] for f in sub], y=[f["lat"] for f in sub], mode="markers", name=t,
+                text=[f["name"] for f in sub], hovertemplate="%{text}<extra>" + t + "</extra>",
+                marker=dict(size=9, color=cfg["hex"], line=dict(color="white", width=1.5))))
+    fig.update_xaxes(range=[g["lngs"].min() - g["half_lng"], g["lngs"].max() + g["half_lng"]], title="경도")
+    fig.update_yaxes(range=[g["lats"].min() - g["half_lat"], g["lats"].max() + g["half_lat"]], title="위도")
+    fig.update_layout(title=f"{view_label} 부하율 히트맵", height=560, margin=dict(l=10, r=10, t=50, b=10),
+                      legend=dict(orientation="h", y=-0.12))
     return fig
 
 
+def summarize(result, view_col, over):
+    df = result["df"]
+    return {"avg": float(df[view_col].mean()), "over": int((df[view_col] >= over).sum()),
+            "gap": int(df["사각지대"].sum()), "zones": len(df)}
+
+
 # ===========================================================
-# TAB 1 — 지도 & 클릭 설치
+# F. 메인 대시보드
 # ===========================================================
-with tab1:
-    col_map, col_panel = st.columns([7, 3])
+st.title("🏙️ 실제 도시 인프라 과부하 분석 시뮬레이터")
+st.caption("Google Maps(Geocoding · Places) 실데이터와 Haversine 거리 기반으로 구역별 인프라 수요·공급·부하율을 시뮬레이션합니다.")
+show_flash()
 
-    with col_map:
-        z_data = to_grid(analyzed_df, "overload_index")
-        fig = build_map_figure(z_data, active_facs, show_heatmap, selected_grades, st.session_state.pending_click)
+center, facilities = ss["center"], ss["facilities"]
+st.markdown(f"**분석 중심:** {center['label']} · 위도 `{center['lat']:.5f}` / 경도 `{center['lng']:.5f}` "
+            f"· 분석 반경 `{center['radius_km']:.1f} km`")
 
-        event = None
-        try:
-            event = st.plotly_chart(
-                fig, use_container_width=True, on_select="rerun",
-                selection_mode="points", key="city_map",
-            )
-        except TypeError:
-            # 구버전 streamlit: on_select 미지원 → 일반 차트로 표시
-            st.plotly_chart(fig, use_container_width=True)
-            st.caption("⚠️ 현재 streamlit 버전에서는 지도 클릭 설치가 지원되지 않습니다. 사이드바의 좌표 직접 입력을 이용해 주세요.")
+# ---- 분석 실행 ----
+view_col = "종합 부하율" if view_metric == "종합" else f"부하율_{view_metric}"
+result = base_result = None
+if not ss["loaded"]:
+    st.info("👈 사이드바에서 지역명을 입력하고 **검색 및 시설 수집**을 눌러 주세요. 지도를 클릭해 새 중심을 정할 수도 있습니다.")
+elif not active_types:
+    st.warning("분석 대상 시설 유형을 하나 이상 선택해 주세요. (사이드바 3. 분석 기준)")
+else:
+    params = dict(grid_n=grid_n, decay=decay, agg=agg, base_pop=base_pop, conc=conc, noise=noise_sigma,
+                  seed=seed, rates=rates, mult=mult, active=active_types)
+    result = analyze_zones(facilities_to_df(facilities), center, params)
+    # 비교 기준: 수집 직후 원본 시설(용량 배율 100%)로 같은 분석을 한 번 더 수행
+    base_params = {**params, "mult": {t: 100 for t in FACILITY_TYPES}}
+    base_result = analyze_zones(facilities_to_df(ss["facilities_base"]), center, base_params)
 
-        if event:
-            points = (event.get("selection") or {}).get("points") or []
-            if points:
-                px_ = int(round(points[0]["x"]))
-                py_ = int(round(points[0]["y"]))
-                px_ = min(max(px_, 0), GRID_SIZE - 1)
-                py_ = min(max(py_, 0), GRID_SIZE - 1)
-                st.session_state.pending_click = (px_, py_)
+    cur, base = summarize(result, view_col, over_thr), summarize(base_result, view_col, over_thr)
+    for t in active_types:
+        if not any(f["type"] == t for f in facilities):
+            st.warning(f"'{t}' 시설이 없어 해당 유형은 전 구역이 사각지대(부하율 상한)로 계산됩니다.")
+    m1, m2, m3, m4, m5 = st.columns(5)
+    m1.metric("보유 시설", f"{len(facilities)}곳", f"{len(facilities) - len(ss['facilities_base']):+d} (원본 대비)")
+    m2.metric("분석 구역", f"{cur['zones']}개")
+    m3.metric(f"평균 {view_metric} 부하율", f"{cur['avg']:.2f}", f"{cur['avg'] - base['avg']:+.2f}", delta_color="inverse")
+    m4.metric("과부하 구역", f"{cur['over']}개", f"{cur['over'] - base['over']:+d}", delta_color="inverse")
+    m5.metric("사각지대 구역", f"{cur['gap']}개", f"{cur['gap'] - base['gap']:+d}", delta_color="inverse")
 
-    with col_panel:
-        st.subheader("📍 구역 분석 & 설치")
-        pc = st.session_state.pending_click
+# ---- 지도 + 우측 패널 ----
+col_map, col_side = st.columns([7, 3])
 
-        if pc is None:
-            st.info("지도의 칸을 클릭하면 해당 구역의 분석 결과와 설치 옵션이 여기에 나타납니다.")
+with col_map:
+    st.subheader("🗺️ 지도")
+    fmap = build_map(center, facilities, result, view_col, view_metric, over_thr, crit_thr,
+                     tile_choice, show_zones, show_cover, ss.get("clicked"))
+    # returned_objects를 제한해 불필요한 rerun을 줄이고, 지도 뷰(center/zoom)는 세션에 보존
+    map_data = st_folium(fmap, key="main_map", height=600, use_container_width=True,
+                         returned_objects=["last_clicked", "center", "zoom"],
+                         center=ss["view_center"], zoom=ss["view_zoom"])
+    if map_data:
+        raw = map_data.get("last_clicked")
+        if raw and raw != ss["last_raw_click"]:       # 새 클릭일 때만 반영 (이전 클릭 재처리 방지)
+            ss["last_raw_click"] = raw
+            ss["clicked"] = {"lat": raw["lat"], "lng": raw["lng"]}
+        if ss.pop("skip_view_sync", False):
+            pass
         else:
-            x, y = pc
-            default_type = facility_type_filter if facility_type_filter != "전체" else \
-                best_type_for_cell(city_df, st.session_state.facilities, x, y)
-            diag = generate_diagnosis(city_df, st.session_state.facilities, x, y, default_type)
+            if map_data.get("center"):
+                ss["view_center"] = [map_data["center"]["lat"], map_data["center"]["lng"]]
+            if map_data.get("zoom"):
+                ss["view_zoom"] = int(map_data["zoom"])
 
-            st.markdown(f"**선택 위치:** ({x}, {y}) · {diag['zone']}")
-            st.markdown(badge_html(diag["overload"]), unsafe_allow_html=True)
-            st.caption(f"수요 {diag['demand']:.0f} · 공급 {diag['supply']:.0f}")
-
-            with st.expander("🔍 원인 분석 보기", expanded=False):
-                for c in diag["causes"]:
-                    st.markdown(f'<div class="cause-box">{c}</div>', unsafe_allow_html=True)
-
-            st.markdown("##### 🏗️ 이 위치에 시설 설치")
-            with st.form("click_install_form"):
-                i_name = st.text_input("시설 이름", f"신규 {default_type}")
-                i_type = st.selectbox("시설 유형", FACILITY_TYPES, index=FACILITY_TYPES.index(default_type))
-                i_cap = st.number_input("수용 용량", 50, 500, diag["suggested_capacity"], step=10)
-                i_rad = st.slider("커버리지 반경", 1.0, 5.0, float(diag["suggested_radius"]), step=0.5)
-                if st.form_submit_button("✅ 이 위치에 설치", use_container_width=True):
-                    add_facility(i_name.strip() or f"신규 {i_type}", i_type, x, y, i_cap, i_rad)
-                    st.success(f"({x},{y})에 '{i_name}' 설치 완료!")
-                    st.rerun()
-
-# ===========================================================
-# TAB 2 — AI 진단 & 추천
-# ===========================================================
-with tab2:
-    st.subheader("🤖 AI 추천 위치 진단")
-
-    diag = generate_diagnosis(
-        city_df, st.session_state.facilities, rec_location["x"], rec_location["y"], rec_location["suggested_type"]
-    )
-    style = FACILITY_STYLE[rec_location["suggested_type"]]
-
-    st.markdown(f"#### 📍 ({rec_location['x']}, {rec_location['y']}) · {rec_location['zone']}")
-    st.markdown(badge_html(rec_location["overload_index"]), unsafe_allow_html=True)
-    st.write("")
-
-    st.markdown("**🔍 왜 이 지역의 부하율이 높을까요?**")
-    for c in diag["causes"]:
-        st.markdown(f'<div class="cause-box">{c}</div>', unsafe_allow_html=True)
-
-    st.markdown("**💡 해결 방안**")
-    st.info(f'{style["icon"]} {diag["solution_text"]}')
-
-    st.markdown("---")
-    compare_type = rec_location["suggested_type"]
-    before_df, _ = calculate_overload(city_df, st.session_state.facilities, compare_type)
-    simulated_facs = st.session_state.facilities + [{
-        "id": "sim-new", "name": "★ 추천 신규 시설", "type": compare_type,
-        "x": rec_location["x"], "y": rec_location["y"],
-        "capacity": diag["suggested_capacity"], "radius": diag["suggested_radius"],
-    }]
-    after_df, _ = calculate_overload(city_df, simulated_facs, compare_type)
-    z_before, z_after = to_grid(before_df, "overload_index"), to_grid(after_df, "overload_index")
-    shared_max = max(float(z_before.max()), float(z_after.max()), 1.0)
-
-    col_before, col_after = st.columns(2)
-    with col_before:
-        st.markdown(f"##### 🔴 개선 전 ({style['icon']} {compare_type} 기준)")
-        fb = px.imshow(z_before, origin="lower", color_continuous_scale=SOFT_SCALE, zmin=0, zmax=shared_max,
-                        labels=dict(x="X", y="Y", color="부하율(%)"))
-        fb.update_layout(height=400, margin=dict(l=10, r=10, t=10, b=10))
-        st.plotly_chart(fb, use_container_width=True)
-    with col_after:
-        st.markdown("##### 🟢 추천 시설 추가 후")
-        fa = px.imshow(z_after, origin="lower", color_continuous_scale=SOFT_SCALE, zmin=0, zmax=shared_max,
-                        labels=dict(x="X", y="Y", color="부하율(%)"))
-        fa.add_scatter(x=[rec_location["x"]], y=[rec_location["y"]], mode="markers+text",
-                        marker=dict(symbol="star", size=18, color="#f59e0b", line=dict(width=1, color="#78350f")),
-                        text=["★ 추천위치"], textposition="top center", showlegend=False)
-        fa.update_layout(height=400, margin=dict(l=10, r=10, t=10, b=10))
-        st.plotly_chart(fa, use_container_width=True)
-
-    before_avg, after_avg = before_df["overload_index"].mean(), after_df["overload_index"].mean()
-    st.success(
-        f"{compare_type} 기준 평균 부하율이 **{before_avg:.1f}% → {after_avg:.1f}%** "
-        f"(▼ {before_avg - after_avg:.1f}%p) 로 완화될 것으로 예측됩니다."
-    )
-
-    st.markdown("---")
-    st.markdown("**⚠️ 그 외 주의가 필요한 지역 Top 3**")
-    hotspots = get_top_hotspots(before_df, (rec_location["x"], rec_location["y"]), n=3)
-    if hotspots:
-        for h in hotspots:
-            hd = generate_diagnosis(city_df, st.session_state.facilities, int(h["x"]), int(h["y"]), compare_type)
-            st.markdown(
-                f'- **({int(h["x"])},{int(h["y"])})** {h["zone"]} — {badge_html(h["overload_index"])}'
-                f'<br><span style="color:#6b7280;font-size:0.85rem">{hd["causes"][0]}</span>',
-                unsafe_allow_html=True,
-            )
+with col_side:
+    st.subheader("📌 클릭 지점")
+    clk = ss.get("clicked")
+    if clk:
+        st.info(f"👉 위도 `{clk['lat']:.5f}`, 경도 `{clk['lng']:.5f}`")
+        try:
+            addr = reverse_geocode_cached(round(clk["lat"], 5), round(clk["lng"], 5))
+            st.caption(f"📍 {addr}" if addr else "주소 정보를 찾지 못했습니다.")
+        except Exception as e:
+            st.caption(f"주소 조회 실패: {mask_secret(e)}")
+        st.button("🎯 이 지점을 새 분석 중심으로 설정", on_click=cb_search_click)
     else:
-        st.caption("추가로 주의가 필요한 지역이 없습니다.")
+        st.caption("지도를 클릭하면 좌표와 주소가 표시됩니다.")
 
-# ===========================================================
-# TAB 3 — 상세 데이터
-# ===========================================================
-with tab3:
-    st.subheader("등록된 시설 목록")
-    if st.session_state.facilities:
-        fac_table = pd.DataFrame(st.session_state.facilities)[["name", "type", "x", "y", "capacity", "radius"]]
-        fac_table.columns = ["이름", "유형", "X", "Y", "용량", "반경"]
-        st.dataframe(fac_table, use_container_width=True, hide_index=True)
+    st.subheader("🚦 부하율 범례")
+    low = 0.7 * over_thr
+    st.markdown(f"🟢 여유 (< {low:.2f})  \n🟡 보통 ({low:.2f} ~ {over_thr:.2f})  \n"
+                f"🟠 과부하 ({over_thr:.2f} ~ {crit_thr:.2f})  \n🔴 심각 (≥ {crit_thr:.2f})")
+
+    if result is not None:
+        st.subheader(f"🔥 위험 구역 TOP 5 ({view_metric})")
+        top = result["df"].nlargest(5, view_col)[["구역", view_col]].copy()
+        top["상태"] = classify_array(top[view_col], over_thr, crit_thr)
+        st.dataframe(top.round(2), hide_index=True)
+
+# ---- 상세 탭 ----
+tab_heat, tab_fac, tab_zone, tab_info = st.tabs(["🔥 히트맵", "🏢 시설 목록", "🧮 구역 상세", "ℹ️ 계산 방식"])
+
+with tab_heat:
+    if result is not None:
+        st.plotly_chart(build_heatmap(result, view_col, view_metric, facilities, over_thr, crit_thr))
     else:
-        st.info("등록된 시설이 없습니다.")
+        st.caption("시설을 수집하면 히트맵이 표시됩니다.")
 
-    st.subheader(f"부하율 상위 10개 구역 (현재 필터: {facility_type_filter})")
-    worst = analyzed_df.sort_values("overload_index", ascending=False).head(10).copy()
-    worst["등급"] = worst["overload_index"].apply(lambda v: risk_level(v)[0])
-    worst_display = worst[["x", "y", "zone", "demand", "supply", "overload_index", "등급"]]
-    worst_display.columns = ["X", "Y", "구역", "수요", "공급", "부하율(%)", "등급"]
-    st.dataframe(worst_display, use_container_width=True, hide_index=True)
+with tab_fac:
+    if facilities:
+        fdf = facilities_to_df(facilities)
+        fdf["유효 용량"] = (fdf["capacity"] * fdf["type"].map(lambda t: mult[t] / 100.0)).round(0)
+        fdf["출처"] = fdf["source"].map({"google": "Google Places", "user": "사용자 추가"})
+        st.dataframe(fdf.rename(columns={"name": "시설명", "type": "유형", "lat": "위도", "lng": "경도",
+                                         "capacity": "기본 용량", "radius_km": "반경(km)"})
+                     [["시설명", "유형", "위도", "경도", "기본 용량", "유효 용량", "반경(km)", "출처"]],
+                     hide_index=True)
+    else:
+        st.caption("표시할 시설이 없습니다.")
 
-    with st.expander("전체 격자 데이터 보기"):
-        full_display = analyzed_df[["x", "y", "zone", "demand", "supply", "overload_index"]].copy()
-        full_display.columns = ["X", "Y", "구역", "수요", "공급", "부하율(%)"]
-        st.dataframe(full_display, use_container_width=True, hide_index=True)
+with tab_zone:
+    if result is not None:
+        zdf = result["df"].drop(columns=["행", "열"]).round(3)
+        zdf["상태"] = classify_array(result["df"][view_col], over_thr, crit_thr)
+        st.dataframe(zdf, hide_index=True)
+        st.download_button("⬇️ 구역 분석 결과 CSV 다운로드", zdf.to_csv(index=False).encode("utf-8-sig"),
+                           file_name="zone_analysis.csv", mime="text/csv")
+    else:
+        st.caption("분석 결과가 없습니다.")
+
+with tab_info:
+    st.markdown("""
+**계산 순서**
+1. 분석 반경 안을 N×N 격자로 나누고, 각 구역 중심 좌표를 구합니다.
+2. 추정 인구 = `기본 인구 × (1 + 도심집중도 × exp(-(중심거리/σ)²)) × 로그정규 잡음` (σ = 반경의 50%)
+3. 수요(유형) = `추정 인구 × 유형별 수요율`
+4. 공급(유형) = `Σ 시설 용량 × 용량 배율 × 거리 가중치(Haversine 거리 / 커버리지 반경)`
+5. 부하율(OI) = `수요 / 공급` (공급 0 → 상한 5.0, 사각지대로 집계) → 종합 = 유형별 OI의 평균 또는 최댓값
+
+**주의**: Google은 실제 인구/이용량을 제공하지 않으므로 인구·수요율·시설 용량은 *가정값*입니다.
+실제 통계(예: 격자 인구 CSV)를 `analyze_zones()`의 `population` 계산 부분에 연결하면 정확도를 높일 수 있습니다.
+분석 반경 바깥 시설은 수집하지 않으므로 가장자리 구역의 공급은 다소 과소 추정될 수 있습니다.
+""")
