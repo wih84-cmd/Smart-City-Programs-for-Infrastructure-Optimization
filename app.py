@@ -20,9 +20,11 @@ HTTP referrer 제한 + Maps JavaScript API 제한을 각각 적용하세요.
     streamlit run app.py
 
 Google Cloud에서 Places API (New)를 활성화해야 합니다. Geocoding API는 선택 사항이며, Maps JavaScript API는 Google 지도 바탕을 쓸 때만 필요합니다.
+시설 유형은 경찰·병원·소방서뿐 아니라 약국·학교·대학교·도서관·공원·문화/체육·교통·생활/공공시설을 지원합니다.
 주의: Google Places는 시설의 이름/위치/유형을 제공하지만, 실제 수용 인원이나
 지역별 인구·이용량을 제공하지 않습니다. 따라서 용량·수요·커버리지 값은
 명시적으로 설정하는 시뮬레이션 가정이며, 공인된 행정 통계가 아닙니다.
+Google Places 데이터의 파생 분석 및 표시에는 별도 약관·저작자 표시 제한이 있으므로 배포 전 공식 정책을 확인하세요.
 """
 from __future__ import annotations
 
@@ -63,19 +65,29 @@ PLACES_TEXT_URL = "https://places.googleapis.com/v1/places:searchText"
 GEOCODE_URL = "https://maps.googleapis.com/maps/api/geocode/json"
 
 FACILITY_TYPES: dict[str, dict[str, Any]] = {
-    "경찰서": {
-        "place_type": "police", "color": "blue", "hex": "#2878B5", "icon": "shield",
-        "capacity": 150, "radius_km": 2.5, "demand_rate": 0.04,
-    },
-    "병원": {
-        "place_type": "hospital", "color": "red", "hex": "#D64545", "icon": "hospital",
-        "capacity": 200, "radius_km": 3.0, "demand_rate": 0.08,
-    },
-    "소방서": {
-        "place_type": "fire_station", "color": "orange", "hex": "#E58A27", "icon": "fire",
-        "capacity": 120, "radius_km": 3.0, "demand_rate": 0.03,
-    },
+    # 안전·의료 핵심 시설
+    "경찰서": {"place_type": "police", "color": "blue", "hex": "#2878B5", "icon": "shield", "capacity": 150, "radius_km": 2.5, "demand_rate": 0.04},
+    "병원": {"place_type": "hospital", "color": "red", "hex": "#D64545", "icon": "hospital", "capacity": 200, "radius_km": 3.0, "demand_rate": 0.08},
+    "소방서": {"place_type": "fire_station", "color": "orange", "hex": "#E58A27", "icon": "fire", "capacity": 120, "radius_km": 3.0, "demand_rate": 0.03},
+    # 의료·교육·문화·공원 시설
+    "약국": {"place_type": "pharmacy", "color": "pink", "hex": "#D96A9B", "icon": "plus-square", "capacity": 90, "radius_km": 1.5, "demand_rate": 0.10},
+    "학교": {"place_type": "school", "color": "cadetblue", "hex": "#4C9B9B", "icon": "graduation-cap", "capacity": 300, "radius_km": 2.0, "demand_rate": 0.05},
+    "대학교": {"place_type": "university", "color": "darkblue", "hex": "#3451A3", "icon": "university", "capacity": 500, "radius_km": 4.0, "demand_rate": 0.02},
+    "도서관": {"place_type": "library", "color": "beige", "hex": "#A48B62", "icon": "book", "capacity": 100, "radius_km": 2.0, "demand_rate": 0.03},
+    "공원": {"place_type": "park", "color": "green", "hex": "#3B9B61", "icon": "tree", "capacity": 150, "radius_km": 1.5, "demand_rate": 0.08},
+    "문화시설": {"place_type": "museum", "color": "darkpurple", "hex": "#8054A6", "icon": "landmark", "capacity": 100, "radius_km": 3.0, "demand_rate": 0.02},
+    "체육시설": {"place_type": "gym", "color": "darkgreen", "hex": "#287C55", "icon": "dumbbell", "capacity": 120, "radius_km": 2.0, "demand_rate": 0.04},
+    # 교통·생활·공공 시설
+    "지하철역": {"place_type": "subway_station", "color": "darkred", "hex": "#A84646", "icon": "train", "capacity": 300, "radius_km": 2.0, "demand_rate": 0.12},
+    "버스정류장": {"place_type": "bus_stop", "color": "lightblue", "hex": "#65A9C8", "icon": "bus", "capacity": 80, "radius_km": 0.8, "demand_rate": 0.10},
+    "버스터미널": {"place_type": "bus_station", "color": "darkcyan", "hex": "#258D91", "icon": "bus-simple", "capacity": 250, "radius_km": 5.0, "demand_rate": 0.02},
+    "주민센터": {"place_type": "community_center", "color": "gray", "hex": "#777777", "icon": "building", "capacity": 100, "radius_km": 1.5, "demand_rate": 0.015},
+    "우체국": {"place_type": "post_office", "color": "darkred", "hex": "#A53A3A", "icon": "mail", "capacity": 80, "radius_km": 2.0, "demand_rate": 0.01},
+    "주차장": {"place_type": "parking", "color": "black", "hex": "#555555", "icon": "square-parking", "capacity": 200, "radius_km": 1.2, "demand_rate": 0.08},
+    "마트": {"place_type": "supermarket", "color": "lightgreen", "hex": "#78A95B", "icon": "shopping-cart", "capacity": 180, "radius_km": 1.5, "demand_rate": 0.15},
 }
+CORE_TYPES = ["경찰서", "병원", "소방서"]
+DEFAULT_SEARCH_TYPES = ["경찰서", "병원", "소방서", "약국", "학교", "공원", "지하철역", "도서관", "주민센터"]
 FAC_COLUMNS = ["id", "name", "type", "lat", "lng", "capacity", "radius_km", "source", "place_id", "google_primary_type", "google_types"]
 DECAY_MODES = ["선형 감쇠", "가우시안 감쇠", "균등 (반경 내 전량)"]
 STATUS_COLORS = {"여유": "#2ca02c", "보통": "#e5bd35", "과부하": "#f28e2b", "심각": "#d62728"}
@@ -216,6 +228,126 @@ def summarize(result: dict[str, Any], view_col: str, overload: float, critical: 
         "critical": int(np.sum(values >= critical)),
         "gap": int(df["사각지대"].sum()),
         "zones": len(df),
+    }
+
+
+def diagnose_zone(
+    zone: pd.Series,
+    facilities: list[dict[str, Any]],
+    params: dict[str, Any],
+    view_metric: str,
+    overload: float,
+    critical: float,
+) -> dict[str, Any]:
+    """구역의 판정 상태를 실제 모델 변수(수요·공급·거리·시설 수)로 설명한다."""
+    zone_lat, zone_lng = float(zone["위도"]), float(zone["경도"])
+    if view_metric == "종합":
+        overall_oi = float(zone["종합 부하율"])
+        component_ois = {t: float(zone[f"부하율_{t}"]) for t in params["active_types"]}
+        driver_type = max(component_ois, key=component_ois.get)
+        aggregate_name = "유형별 OI 최댓값" if params["aggregate"] == "max" else "유형별 OI 평균"
+    else:
+        overall_oi = float(zone[f"부하율_{view_metric}"])
+        component_ois = {view_metric: overall_oi}
+        driver_type = view_metric
+        aggregate_name = f"{view_metric} 단일 유형 OI"
+
+    status = str(classify_array([overall_oi], overload, critical)[0])
+    demand = float(zone[f"수요_{driver_type}"])
+    supply = float(zone[f"공급_{driver_type}"])
+    type_oi = float(zone[f"부하율_{driver_type}"])
+    typed = [f for f in facilities if f["type"] == driver_type]
+    detail_rows: list[dict[str, Any]] = []
+    for ftype in params["active_types"]:
+        type_demand = float(zone[f"수요_{ftype}"])
+        type_supply = float(zone[f"공급_{ftype}"])
+        type_value = float(zone[f"부하율_{ftype}"])
+        detail_rows.append({
+            "시설 유형": ftype,
+            "추정 수요": type_demand,
+            "가중 공급": type_supply,
+            "유형별 OI": type_value,
+            "시설 수": sum(1 for f in facilities if f["type"] == ftype),
+        })
+    detail_rows.sort(key=lambda x: x["유형별 OI"], reverse=True)
+
+    scale = float(params["capacity_scale"].get(driver_type, 100)) / 100.0
+    nearby_count = 0
+    nearest_name = "수집된 시설 없음"
+    nearest_distance = None
+    nearest_radius = None
+    top_contributor = None
+    if typed:
+        distances = np.array([
+            haversine_km(zone_lat, zone_lng, f["lat"], f["lng"]) for f in typed
+        ], dtype=float)
+        weights = np.array([
+            coverage_weight(dist, float(f["radius_km"]), params["decay"])
+            for dist, f in zip(distances, typed)
+        ], dtype=float)
+        contributions = np.array([
+            float(f["capacity"]) * scale * float(w)
+            for f, w in zip(typed, weights)
+        ], dtype=float)
+        nearest_idx = int(np.argmin(distances))
+        nearest_name = typed[nearest_idx]["name"]
+        nearest_distance = float(distances[nearest_idx])
+        nearest_radius = float(typed[nearest_idx]["radius_km"])
+        nearby_count = int(np.sum(weights > 0))
+        if np.any(contributions > 0):
+            top_idx = int(np.argmax(contributions))
+            top_contributor = {
+                "name": typed[top_idx]["name"],
+                "contribution": float(contributions[top_idx]),
+                "distance": float(distances[top_idx]),
+                "radius": float(typed[top_idx]["radius_km"]),
+            }
+
+    if supply <= EPS:
+        supply_reason = (
+            f"{driver_type}의 서비스 반경 안에 이 구역의 공급으로 계산되는 시설이 없어 "
+            f"모델 공급이 0입니다. 이 경우 OI는 상한값 {OI_CAP:.1f}으로 처리됩니다."
+        )
+    else:
+        supply_reason = (
+            f"{driver_type} 추정 수요 {demand:,.1f} ÷ 가중 공급 {supply:,.1f} "
+            f"= 유형별 OI {type_oi:.2f}입니다. 거리 감쇠를 반영한 공급 기여 시설은 {nearby_count}곳입니다."
+        )
+    if top_contributor:
+        facility_reason = (
+            f"공급 기여가 가장 큰 시설은 '{top_contributor['name']}'이며, "
+            f"직선거리 {top_contributor['distance']:.2f}km에서 모델 공급에 {top_contributor['contribution']:.1f}만큼 기여합니다."
+        )
+    elif nearest_distance is not None:
+        facility_reason = (
+            f"가장 가까운 시설은 '{nearest_name}'({nearest_distance:.2f}km)이지만 "
+            f"해당 서비스 반경({nearest_radius:.1f}km)·거리 가중치 기준으로 공급 기여가 없습니다."
+        )
+    else:
+        facility_reason = f"현재 수집된 {driver_type} 데이터가 없습니다. 검색 결과 누락 가능성도 확인해야 합니다."
+
+    if status == "심각":
+        decision_reason = f"심각 판정: 종합 OI {overall_oi:.2f}가 심각 기준 {critical:.2f} 이상입니다."
+    elif status == "과부하":
+        decision_reason = f"과부하 판정: 종합 OI {overall_oi:.2f}가 과부하 기준 {overload:.2f} 이상, 심각 기준 {critical:.2f} 미만입니다."
+    elif status == "보통":
+        decision_reason = f"보통 판정: 종합 OI {overall_oi:.2f}가 여유 기준 {0.7 * overload:.2f} 이상, 과부하 기준 {overload:.2f} 미만입니다."
+    else:
+        decision_reason = f"여유 판정: 종합 OI {overall_oi:.2f}가 여유 기준 {0.7 * overload:.2f} 미만입니다."
+
+    return {
+        "zone": str(zone["구역"]),
+        "status": status,
+        "oi": overall_oi,
+        "driver": driver_type,
+        "aggregate": aggregate_name,
+        "decision_reason": decision_reason,
+        "supply_reason": supply_reason,
+        "facility_reason": facility_reason,
+        "population": float(zone["추정인구"]),
+        "type_oi": type_oi,
+        "details": detail_rows,
+        "gap": bool(zone["사각지대"]),
     }
 
 
@@ -474,7 +606,7 @@ def run_search(query: str, radius_m: int, selected_types: list[str]) -> None:
         notify("warning", "검색할 지역명을 입력해 주세요.")
         return
     try:
-        with st.spinner("Google Geocoding 및 Places API에서 주변 시설을 수집하고 있습니다..."):
+        with st.spinner("위치 검색 및 Google Places API에서 주변 시설을 수집하고 있습니다..."):
             geo = resolve_location(query, API_KEY)
             if not geo:
                 notify("error", f"'{query}' 위치를 찾지 못했습니다.")
@@ -499,6 +631,8 @@ def run_search(query: str, radius_m: int, selected_types: list[str]) -> None:
     }
     ss["base_facilities"] = facilities
     ss["sim_facilities"] = []
+    found_types = [t for t in selected_types if any(f["type"] == t for f in facilities)]
+    ss["active_types"] = found_types or list(selected_types)
     ss["loaded"] = True
     ss["clicked"] = None
     # 마지막 지도 클릭 토큰은 유지해 st_folium이 이전 클릭값을 반환해도 재처리하지 않는다.
@@ -535,6 +669,8 @@ def add_simulated_facility(name: str, ftype: str, capacity: int, radius_km: floa
 
 
 init_state()
+if "pending_active_types" in ss:
+    ss["active_types"] = ss.pop("pending_active_types")
 
 # -----------------------------------------------------------------------------
 # 4. 사이드바: 사용 흐름 1 -> 3
@@ -548,16 +684,20 @@ with st.sidebar:
             search_query = st.text_input("중심 위치", value=ss.get("search_query", "서울시청"), key="search_query")
             search_radius_m = st.slider("시설 수집 반경", 500, 10000, 3000, 500, format="%d m", key="search_radius_m")
             search_types = st.multiselect(
-                "수집할 시설 유형", list(FACILITY_TYPES), default=list(FACILITY_TYPES), key="search_types"
+                "수집할 시설 유형", list(FACILITY_TYPES),
+                default=DEFAULT_SEARCH_TYPES, key="search_types"
             )
             search_submit = st.form_submit_button("🔍 Google 시설 수집", type="primary", use_container_width=True)
-        st.caption("Places API (New)의 Nearby Search를 유형별 1회 호출합니다. 유형별 최대 20개 결과를 사용합니다.")
+        st.caption("선택한 유형별로 Places Nearby Search를 호출합니다. 유형별 최대 20개 결과이며, 선택 유형이 많을수록 API 요청·과금이 늘어날 수 있습니다.")
         if search_submit:
             run_search(search_query, search_radius_m, search_types)
 
     with st.expander("② 분석 기준 조정", expanded=True):
+        active_defaults = [t for t in FACILITY_TYPES if any(f["type"] == t for f in ss["base_facilities"])]
+        if not active_defaults:
+            active_defaults = CORE_TYPES
         active_types = st.multiselect(
-            "분석 대상 유형", list(FACILITY_TYPES), default=list(FACILITY_TYPES), key="active_types"
+            "분석 대상 유형", list(FACILITY_TYPES), default=active_defaults, key="active_types"
         )
         grid_n = st.slider("격자 해상도", 5, 20, 10, help="N×N 격자. 값이 높을수록 세밀하지만 계산량이 커집니다.")
         decay = st.selectbox("시설 거리 가중치", DECAY_MODES, index=0)
@@ -569,13 +709,20 @@ with st.sidebar:
         concentration = st.slider("중심부 인구 집중도", 0.0, 4.0, 1.5, 0.1)
         noise = st.slider("수요 변동성", 0.0, 0.6, 0.2, 0.05)
         seed = st.number_input("난수 시드(전·후 동일 조건)", 0, 9999, 42)
-        st.markdown("**유형별 인구 대비 수요율**")
-        demand_rates = {
-            t: st.slider(t, 0.0, 0.30, float(cfg["demand_rate"]), 0.005, key=f"rate_{t}")
-            for t, cfg in FACILITY_TYPES.items()
-        }
-        st.markdown("**유형별 시설 용량 배율**")
-        capacity_scale = {t: st.slider(f"{t} 용량 배율", 20, 300, 100, 5, key=f"scale_{t}") for t in FACILITY_TYPES}
+        show_advanced = st.checkbox("유형별 수요율·용량 배율 세부 조정 표시", value=False)
+        demand_rates: dict[str, float] = {}
+        capacity_scale: dict[str, int] = {}
+        if show_advanced:
+            st.caption("아래 값은 공식 통계가 아니라 시뮬레이션 가정입니다. 실제 수용 인원·이용량과 다를 수 있습니다.")
+            st.markdown("**유형별 인구 대비 수요율**")
+            for t, cfg in FACILITY_TYPES.items():
+                demand_rates[t] = st.slider(t, 0.0, 0.30, float(ss.get(f"rate_{t}", cfg["demand_rate"])), 0.005, key=f"rate_{t}")
+            st.markdown("**유형별 시설 용량 배율**")
+            for t in FACILITY_TYPES:
+                capacity_scale[t] = st.slider(f"{t} 용량 배율", 20, 300, int(ss.get(f"scale_{t}", 100)), 5, key=f"scale_{t}")
+        else:
+            demand_rates = {t: float(ss.get(f"rate_{t}", cfg["demand_rate"])) for t, cfg in FACILITY_TYPES.items()}
+            capacity_scale = {t: int(ss.get(f"scale_{t}", 100)) for t in FACILITY_TYPES}
         overload_threshold = st.slider("과부하 기준(OI)", 0.5, 2.0, 1.0, 0.05)
         critical_threshold = st.slider("심각 기준(OI)", 1.0, 4.0, max(1.5, overload_threshold + 0.1), 0.05)
         critical_threshold = max(critical_threshold, overload_threshold + 0.05)
@@ -750,7 +897,7 @@ map_col = "종합 부하율" if view_metric == "종합" else f"부하율_{view_m
 left_map, right_info = st.columns([2.0, 1.0])
 with left_map:
     st.subheader("🗺️ 지도 — 마커에 마우스를 올리면 실제 시설명을 확인할 수 있습니다")
-    st.caption("Google Maps 브라우저 키가 정상 작동하면 Google 지도가 표시됩니다. Google 지도가 뜨지 않으면 레이어 메뉴에서 OpenStreetMap을 선택할 수 있습니다.")
+    st.caption("Google Places 시설 마커는 Google 지도 레이어를 사용할 때 표시합니다. Google 지도 키가 없으면 OSM 지도에는 시뮬레이션 시설만 표시하고, 실제 장소 데이터는 시설 데이터 표에서 확인하세요.")
     fmap = folium.Map(location=ss["view_center"], zoom_start=ss["view_zoom"], tiles=None, control_scale=True)
     # GoogleMutant가 실패해도 지도가 빈 화면이 되지 않도록 OSM을 기본 바탕으로 먼저 추가한다.
     folium.TileLayer(
@@ -819,6 +966,8 @@ with left_map:
 
     marker_cluster = MarkerCluster(name="시설 마커").add_to(fmap)
     for facility in map_facilities:
+        if facility["source"] == "google" and not BROWSER_API_KEY:
+            continue  # Google Places 콘텐츠를 OSM 바탕지도 위에 혼합 표시하지 않는다.
         cfg = FACILITY_TYPES[facility["type"]]
         origin_label = "Google Places 실제 등록 정보" if facility["source"] == "google" else "사용자 시뮬레이션"
         popup_html = (
@@ -894,6 +1043,9 @@ with right_info:
                     }
                     ss["base_facilities"] = facilities
                     ss["sim_facilities"] = []
+                    selected_now = list(ss.get("search_types", DEFAULT_SEARCH_TYPES))
+                    found_now = [t for t in selected_now if any(f["type"] == t for f in facilities)]
+                    ss["pending_active_types"] = found_now or selected_now
                     ss["loaded"] = True
                     ss["view_center"] = [clicked["lat"], clicked["lng"]]
                     ss["view_zoom"] = 13
@@ -920,8 +1072,8 @@ with right_info:
 # 7. 상세 탭 및 다운로드
 # -----------------------------------------------------------------------------
 st.divider()
-tab_facilities, tab_zones, tab_heat, tab_method = st.tabs(
-    ["🏢 시설 데이터", "🧮 구역별 전/후 비교", "🔥 부하율 히트맵", "ℹ️ 계산 가정 및 한계"]
+tab_facilities, tab_zones, tab_heat, tab_reasons, tab_method = st.tabs(
+    ["🏢 시설 데이터", "🧮 구역별 전/후 비교", "🔥 부하율 히트맵", "🧠 분석 이유", "📚 자료 출처·산식"]
 )
 
 with tab_facilities:
@@ -934,7 +1086,7 @@ with tab_facilities:
             "capacity": "모델 용량", "radius_km": "모델 반경(km)",
             "google_primary_type": "Google primaryType", "google_types": "Google 유형 목록",
         })
-        st.markdown("**Google Maps 장소 정보** — 아래의 Google 시설명 및 유형은 현재 검색 응답에서 불러온 데이터입니다.")
+        st.markdown("**Google Maps 장소 정보** — 아래의 실제 시설명·유형·좌표는 Google Places API 응답입니다. 지도 외부에서 표시되는 Google 장소 데이터의 출처를 명확히 하기 위해 Google Maps 제공 정보를 표시합니다.")
         st.dataframe(
             display_df[["시설명", "시설 유형", "Google primaryType", "Google 유형 목록", "위도", "경도", "모델 용량", "모델 반경(km)", "출처"]],
             use_container_width=True, hide_index=True,
@@ -996,28 +1148,74 @@ with tab_heat:
     else:
         st.info("분석 데이터가 아직 없습니다.")
 
+with tab_reasons:
+    st.subheader("🧠 구역별 과부하 판정 이유")
+    st.caption("규칙 기반 설명입니다. OI 임계값, 추정 수요, 가중 공급, 실제 수집된 시설의 거리·서비스 반경을 이용해 문장으로 변환합니다. AI가 현장 상황을 실시간으로 판단한 결과는 아닙니다.")
+    if scenario_result is not None and active_types:
+        reason_source = facilities_to_df(scenario_facilities)
+        explanation_rows = []
+        worst_zones = scenario_result["df"].sort_values(view_col, ascending=False).head(10)
+        for _, zone_row in worst_zones.iterrows():
+            diagnosis = diagnose_zone(
+                zone_row, scenario_facilities, params, view_metric,
+                overload_threshold, critical_threshold,
+            )
+            explanation_rows.append(diagnosis)
+            with st.expander(
+                f"{diagnosis['zone']} · {diagnosis['status']} · OI {diagnosis['oi']:.2f} · 주요 유형: {diagnosis['driver']}",
+                expanded=(len(explanation_rows) == 1),
+            ):
+                st.markdown(f"**판정:** {diagnosis['decision_reason']}")
+                st.markdown(f"**주요 원인:** {diagnosis['supply_reason']}")
+                st.markdown(f"**시설 거리 근거:** {diagnosis['facility_reason']}")
+                st.caption(
+                    f"종합 계산 방식: {diagnosis['aggregate']} · 추정 인구: {diagnosis['population']:,.0f}명 · "
+                    f"사각지대 표시: {'예' if diagnosis['gap'] else '아니오'}"
+                )
+                detail_df = pd.DataFrame(diagnosis["details"]).rename(columns={
+                    "시설 유형": "시설 유형", "추정 수요": "추정 수요", "가중 공급": "거리 가중 공급",
+                    "유형별 OI": "유형별 OI", "시설 수": "수집 시설 수",
+                })
+                st.dataframe(detail_df.round(3), hide_index=True, use_container_width=True)
+        compact_reason = pd.DataFrame([{
+            "구역": d["zone"], "판정": d["status"], "종합 OI": d["oi"],
+            "주요 원인 유형": d["driver"], "요약": d["supply_reason"],
+        } for d in explanation_rows])
+        st.download_button(
+            "⬇️ 분석 이유 TOP 10 CSV 다운로드",
+            compact_reason.to_csv(index=False).encode("utf-8-sig"),
+            file_name="zone_diagnosis_top10.csv", mime="text/csv",
+        )
+    else:
+        st.info("분석할 데이터가 없습니다. 지역을 검색하고 시설을 수집한 뒤 분석 대상 유형을 선택하세요.")
+
 with tab_method:
+    st.subheader("📚 데이터 출처와 출처별 사용 범위")
     st.markdown(
         """
-**데이터 출처 구분**
-- **Google Places 실제 시설:** Google Places API (New) Nearby Search가 반환한 장소 ID, 시설명, 좌표 및 유형을 사용합니다.
-- **사용자 시뮬레이션 시설:** 사용자가 지정한 이름·좌표·유형으로 생성한 가상 시설입니다. Google Maps에 실제 등록된 시설로 취급하지 않습니다.
+**현재 앱에서 실제 조회하는 데이터**
+- [Google Places API (New) - Nearby Search](https://developers.google.com/maps/documentation/places/web-service/nearby-search): 시설명, 장소 ID, 좌표, Google 장소 유형을 조회합니다. 선택한 유형별 최대 20개 결과를 사용합니다.
+- [Google Places API 장소 유형 목록](https://developers.google.com/maps/documentation/places/web-service/place-types): 경찰·소방·의료·교육·공원·교통·생활 시설을 검색할 때 사용하는 유형 코드의 기준입니다.
+- **지도 바탕:** Google Maps JavaScript API 또는 대체 OpenStreetMap. OSM을 사용하는 경우 [© OpenStreetMap contributors](https://www.openstreetmap.org/copyright) 표기를 유지합니다.
 
-**계산 과정**
+**국내 공공 통계·시설 자료 참고처 (현재 자동 수집에 연결된 것은 아님)**
+- [KOSIS 국가통계포털](https://kosis.kr/): 인구·사회·안전 등 국가승인통계를 확인할 수 있습니다. 이 앱의 '추정 인구'는 KOSIS에서 가져온 값이 아닙니다.
+- [공공데이터포털](https://www.data.go.kr/): 공공기관 시설 위치·현황 데이터가 있는지 확인하고, 이용조건·갱신일·좌표 품질을 검토한 뒤 별도 연동할 수 있습니다.
+
+**현재 모델의 자체 계산식과 가정**
 1. 분석 중심으로부터 지정 반경 내에 N×N 격자를 구성합니다.
-2. 인구는 `기본 추정 인구 × (1 + 중심 집중도 × exp(-(중심거리/σ)²)) × 로그정규 잡음`으로 추정합니다. 여기서 σ는 분석 반경의 절반입니다.
-3. 유형별 수요는 `추정 인구 × 유형별 수요율`로 계산합니다.
-4. 유형별 공급은 `Σ(시설 모델 용량 × 용량 배율 × 거리 가중치)`로 계산합니다.
-5. 부하율(Overload Index)은 `수요 ÷ 공급`이며, 공급이 0인 경우 5.0으로 상한 처리합니다.
-6. **추가 전**은 Google Places 기준 시설만, **추가 후**는 Google Places 기준 시설 + 사용자 시뮬레이션 시설로 계산합니다. 전/후에 동일한 격자·수요·난수 시드를 적용합니다.
+2. 구역별 인구는 `기본 추정 인구 × (1 + 중심 집중도 × exp(-(중심거리/σ)²)) × 로그정규 잡음`으로 생성합니다. σ는 분석 반경의 절반입니다.
+3. 유형별 수요는 `추정 인구 × 사용자가 설정한 유형별 수요율`입니다.
+4. 유형별 공급은 `Σ(모델 용량 × 용량 배율 × 거리 가중치)`입니다. 모델 용량·서비스 반경은 실제 병상·인력·수송량 통계가 아닌 시뮬레이션 기본값입니다.
+5. 유형별 OI는 `추정 수요 ÷ 거리 가중 공급`입니다. 공급이 0이면 OI 상한 5.0으로 계산합니다.
+6. 종합 OI는 선택한 유형별 OI의 평균 또는 최댓값입니다. 여유·보통·과부하·심각은 사용자가 설정한 임계값으로 판정합니다.
+7. 분석 이유는 위 계산값과 가장 가까운 시설, 서비스 반경 내 공급 기여 시설 수를 이용해 규칙 기반으로 생성합니다.
 
-**해석 시 주의사항**
-- Places API는 시설의 실제 병상 수, 인력 수, 출동 가능 대수, 이용량 또는 행정구역 인구를 제공하지 않습니다.
-- 따라서 시설 용량, 서비스 반경, 수요율 및 인구는 사용자가 조정할 수 있는 모델 가정입니다. OI는 실제 행정기관의 공식 과부하율이나 실시간 혼잡도가 아닙니다.
-- Places Nearby Search는 시설 유형별 최대 20개를 반환합니다. 검색 반경·유형·Google API의 제공 범위에 따라 누락될 수 있습니다.
-- 지도 바탕은 Google Maps JavaScript API를 사용합니다. Google Places 콘텐츠를 다른 지도 바탕 위에 혼합하지 않도록 구성했습니다. 브라우저 키는 페이지 소스에 노출되므로 HTTP referrer와 Maps JavaScript API로 제한해야 합니다.
-- Places 콘텐츠의 저장·캐싱·파생 데이터 사용에는 Google Maps Platform 약관 제한이 적용됩니다. 이 앱은 서버 캐시/파일 DB에 Places 응답을 저장하지 않고 현재 Streamlit 세션에서만 표시하지만, 좌표로 부하 지표를 산출하는 사용 방식은 실제 배포 전에 프로젝트의 약관 및 사용권 범위를 별도로 확인해야 합니다.
-- 실제 서비스 배포 전에는 Google 요구사항에 맞는 공개 이용약관 및 개인정보처리방침 링크를 앱 사용자에게 제공해야 합니다.
+**자료 해석·약관 주의**
+- Google Places 데이터는 시설의 실제 병상 수, 직원 수, 출동 가능 대수, 이용량 또는 행정구역별 인구를 제공하지 않습니다. 따라서 결과는 공식 혼잡도·행정기관 판정이 아닙니다.
+- Google Places 정책은 장소 데이터의 저장·캐싱·파생 콘텐츠 이용에 제한을 둡니다. 특히 좌표를 이용한 파생 분석 사례를 별도로 규정하고 있으므로, 이 앱의 공간 부하 분석을 외부 공개·상용 서비스로 배포하기 전에 [Google Places API 정책 및 저작자 표시](https://developers.google.com/maps/documentation/places/web-service/policies?hl=ko)를 검토하고 필요한 권리·허가를 확인해야 합니다.
+- 실제 정책 분석·공공 보고서에 활용할 경우에는 사용 허가가 명확한 공공데이터포털·지자체 공개 시설 좌표와 공식 인구 통계를 기반으로 별도 분석 파이프라인을 구성하는 것이 안전합니다.
+- Google Places 결과를 Google 지도 바탕이 아닌 화면에 표시할 때는 Google Maps 출처 표시 요건을 확인해야 합니다. 이 앱은 브라우저용 Google 지도 키가 없는 경우 OSM 지도 위에 Google Places 시설 마커를 섞어 표시하지 않습니다.
 """
     )
 
