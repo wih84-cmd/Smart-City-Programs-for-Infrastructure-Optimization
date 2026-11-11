@@ -19,7 +19,7 @@ HTTP referrer 제한 + Maps JavaScript API 제한을 각각 적용하세요.
 실행:
     streamlit run app.py
 
-Google Cloud에서 Geocoding API, Places API (New), Maps JavaScript API를 활성화해야 합니다.
+Google Cloud에서 Places API (New)를 활성화해야 합니다. Geocoding API는 선택 사항이며, Maps JavaScript API는 Google 지도 바탕을 쓸 때만 필요합니다.
 주의: Google Places는 시설의 이름/위치/유형을 제공하지만, 실제 수용 인원이나
 지역별 인구·이용량을 제공하지 않습니다. 따라서 용량·수요·커버리지 값은
 명시적으로 설정하는 시뮬레이션 가정이며, 공인된 행정 통계가 아닙니다.
@@ -59,6 +59,7 @@ KM_PER_DEG_LNG_EQ = 111.32
 EPS = 1e-9
 OI_CAP = 5.0
 PLACES_NEARBY_URL = "https://places.googleapis.com/v1/places:searchNearby"
+PLACES_TEXT_URL = "https://places.googleapis.com/v1/places:searchText"
 GEOCODE_URL = "https://maps.googleapis.com/maps/api/geocode/json"
 
 FACILITY_TYPES: dict[str, dict[str, Any]] = {
@@ -256,6 +257,59 @@ def safe_api_error(response: requests.Response) -> str:
     return f"HTTP {response.status_code}: {str(message)[:500]}"
 
 
+def places_text_geocode(query: str, api_key: str) -> dict[str, Any] | None:
+    """Places API (New) Text Search로 지역명/주소를 좌표로 변환한다."""
+    headers = {
+        "Content-Type": "application/json",
+        "X-Goog-Api-Key": api_key,
+        "X-Goog-FieldMask": "places.id,places.displayName,places.location,places.formattedAddress",
+    }
+    search_query = query if any(x in query for x in ("대한민국", "한국", "Korea")) else f"{query}, 대한민국"
+    body = {"textQuery": search_query, "languageCode": "ko", "regionCode": "KR", "pageSize": 1}
+    response = requests.post(PLACES_TEXT_URL, headers=headers, json=body, timeout=25)
+    if not response.ok:
+        raise RuntimeError(safe_api_error(response))
+    places = response.json().get("places", [])
+    if not places:
+        return None
+    place = places[0]
+    loc = place.get("location") or {}
+    if "latitude" not in loc or "longitude" not in loc:
+        return None
+    label = (place.get("displayName") or {}).get("text") or query
+    return {
+        "lat": float(loc["latitude"]),
+        "lng": float(loc["longitude"]),
+        "address": place.get("formattedAddress") or label,
+        "label": label,
+    }
+
+
+def resolve_location(query: str, api_key: str) -> dict[str, Any] | None:
+    """Places Text Search를 우선 사용하고, 실패하면 Geocoding API를 대체 경로로 시도한다."""
+    text_error = None
+    try:
+        result = places_text_geocode(query, api_key)
+        if result:
+            return result
+    except Exception as exc:
+        text_error = exc
+    try:
+        result = geocode_address(query, api_key)
+        if result:
+            return result
+    except Exception as geo_error:
+        if text_error:
+            raise RuntimeError(
+                f"Places Text Search 실패: {mask_api_key(text_error)} / "
+                f"Geocoding 실패: {mask_api_key(geo_error)}"
+            ) from geo_error
+        raise
+    if text_error:
+        raise RuntimeError(f"Places Text Search 실패: {mask_api_key(text_error)}")
+    return None
+
+
 def geocode_address(query: str, api_key: str) -> dict[str, Any] | None:
     response = requests.get(
         GEOCODE_URL,
@@ -410,8 +464,8 @@ def show_notifications() -> None:
 
 def run_search(query: str, radius_m: int, selected_types: list[str]) -> None:
     query = (query or "").strip()
-    if not API_KEY or not BROWSER_API_KEY:
-        notify("error", "서버용/브라우저용 Google API 키 2개를 모두 .env 또는 st.secrets에 설정해 주세요.")
+    if not API_KEY:
+        notify("error", "서버용 GOOGLE_MAPS_API_KEY가 없습니다. .env 또는 .streamlit/secrets.toml을 확인해 주세요.")
         return
     if not selected_types:
         notify("warning", "수집할 시설 유형을 하나 이상 선택해 주세요.")
@@ -421,7 +475,7 @@ def run_search(query: str, radius_m: int, selected_types: list[str]) -> None:
         return
     try:
         with st.spinner("Google Geocoding 및 Places API에서 주변 시설을 수집하고 있습니다..."):
-            geo = geocode_address(query, API_KEY)
+            geo = resolve_location(query, API_KEY)
             if not geo:
                 notify("error", f"'{query}' 위치를 찾지 못했습니다.")
                 return
@@ -440,8 +494,8 @@ def run_search(query: str, radius_m: int, selected_types: list[str]) -> None:
         return
 
     ss["center"] = {
-        "lat": geo["lat"], "lng": geo["lng"], "label": query,
-        "address": geo["address"], "radius_km": float(radius_m) / 1000.0,
+        "lat": geo["lat"], "lng": geo["lng"], "label": geo.get("label") or query,
+        "address": geo.get("address", query), "radius_km": float(radius_m) / 1000.0,
     }
     ss["base_facilities"] = facilities
     ss["sim_facilities"] = []
@@ -582,15 +636,28 @@ base_facilities = [dict(f) for f in ss["base_facilities"]]
 sim_facilities = [dict(f) for f in ss["sim_facilities"]]
 scenario_facilities = base_facilities + sim_facilities
 
-if not API_KEY or not BROWSER_API_KEY:
-    st.error("Google API 키 2개가 모두 필요합니다. 서버용 GOOGLE_MAPS_API_KEY와 지도 표시용 GOOGLE_MAPS_BROWSER_API_KEY를 설정하세요.")
-    st.code(
-        'GOOGLE_MAPS_API_KEY="YOUR_SERVER_API_KEY"\n'
-        'GOOGLE_MAPS_BROWSER_API_KEY="YOUR_BROWSER_API_KEY"',
-        language="toml",
-    )
-    st.info("서버용 키는 IP 제한 및 Places API/Geocoding API 제한을, 브라우저용 키는 HTTP referrer 제한 및 Maps JavaScript API 제한을 설정하세요.")
+if not API_KEY:
+    st.error("서버용 GOOGLE_MAPS_API_KEY가 없습니다. .env 또는 .streamlit/secrets.toml에 설정하세요.")
+    st.code('GOOGLE_MAPS_API_KEY="YOUR_SERVER_API_KEY"', language="toml")
+    st.info("서버용 키에는 Places API (New)를 허용하세요. 위치 검색은 Places Text Search를 우선 사용하므로 Geocoding API는 선택 사항입니다.")
     st.stop()
+
+if not BROWSER_API_KEY:
+    st.warning(
+        "GOOGLE_MAPS_BROWSER_API_KEY가 없어 지도는 OpenStreetMap으로 표시됩니다. "
+        "시설 검색·분석은 계속 사용할 수 있습니다. Google 지도를 표시하려면 별도 브라우저용 키를 추가하세요."
+    )
+with st.expander("Google 지도 / 위치 검색이 실패할 때 확인할 항목", expanded=False):
+    st.markdown(
+        """
+- 서버용 키: **Places API (New)** 활성화 및 API 제한 허용 여부 확인
+- 서버용 키를 IP 제한했다면 Streamlit 실행 PC/서버의 공인 IP 허용
+- 브라우저용 키: **Maps JavaScript API** 활성화 및 HTTP referrer에 `http://localhost:8501/*`, `http://127.0.0.1:8501/*` 등록
+- 배포 중이면 실제 서비스 도메인도 브라우저용 키의 허용 referrer에 추가
+- 서버용 키와 브라우저용 키는 반드시 분리
+- 키/권한 변경 후 몇 분 기다린 뒤 Streamlit 재시작
+        """
+    )
 
 if not ss["loaded"]:
     st.info("왼쪽 ①에서 서울시청, 강남역 등 분석할 중심 위치를 검색하고 Google 시설 데이터를 수집하세요.")
@@ -682,32 +749,43 @@ map_col = "종합 부하율" if view_metric == "종합" else f"부하율_{view_m
 
 left_map, right_info = st.columns([2.0, 1.0])
 with left_map:
-    st.subheader("🗺️ Google 지도 — 마커에 마우스를 올리면 실제 시설명을 확인할 수 있습니다")
+    st.subheader("🗺️ 지도 — 마커에 마우스를 올리면 실제 시설명을 확인할 수 있습니다")
+    st.caption("Google Maps 브라우저 키가 정상 작동하면 Google 지도가 표시됩니다. Google 지도가 뜨지 않으면 레이어 메뉴에서 OpenStreetMap을 선택할 수 있습니다.")
     fmap = folium.Map(location=ss["view_center"], zoom_start=ss["view_zoom"], tiles=None, control_scale=True)
-    # Places API 콘텐츠는 Google Maps 바탕 위에 표시한다.
-    # 브라우저 키는 HTML에 노출되므로 반드시 HTTP referrer 및 Maps JavaScript API로 제한해야 한다.
-    browser_key_html = escape(BROWSER_API_KEY, quote=True)
-    fmap.get_root().header.add_child(
-        folium.Element(
-            f'<script src="https://maps.googleapis.com/maps/api/js?key={browser_key_html}&v=weekly"></script>'
-        ),
-        name="google_maps_javascript_api",
-    )
-    fmap.get_root().header.add_child(
-        folium.Element(
-            '<script src="https://unpkg.com/leaflet.gridlayer.googlemutant@0.16.0/dist/Leaflet.GoogleMutant.js"></script>'
-        ),
-        name="leaflet_google_mutant",
-    )
+    # GoogleMutant가 실패해도 지도가 빈 화면이 되지 않도록 OSM을 기본 바탕으로 먼저 추가한다.
+    folium.TileLayer(
+        tiles="OpenStreetMap",
+        name="OpenStreetMap (대체 지도)",
+        control=True,
+    ).add_to(fmap)
 
-    class GoogleMapsBaseLayer(MacroElement):
-        _template = Template(
-            """{% macro script(this, kwargs) %}
-            L.gridLayer.googleMutant({type: 'roadmap'}).addTo({{ this._parent.get_name() }});
-            {% endmacro %}"""
+    if BROWSER_API_KEY:
+        browser_key_html = escape(BROWSER_API_KEY, quote=True)
+        fmap.get_root().header.add_child(
+            folium.Element(
+                f'<script src="https://maps.googleapis.com/maps/api/js?key={browser_key_html}&v=weekly"></script>'
+            ),
+            name="google_maps_javascript_api",
+        )
+        fmap.get_root().header.add_child(
+            folium.Element(
+                '<script src="https://unpkg.com/leaflet.gridlayer.googlemutant@0.16.0/dist/Leaflet.GoogleMutant.js"></script>'
+            ),
+            name="leaflet_google_mutant",
         )
 
-    fmap.add_child(GoogleMapsBaseLayer())
+        class GoogleMapsBaseLayer(MacroElement):
+            _template = Template(
+                """{% macro script(this, kwargs) %}
+                if (L.gridLayer && L.gridLayer.googleMutant && window.google && window.google.maps) {
+                    L.gridLayer.googleMutant({type: 'roadmap'}).addTo({{ this._parent.get_name() }});
+                } else {
+                    console.warn('Google Maps unavailable; OpenStreetMap fallback remains visible.');
+                }
+                {% endmacro %}"""
+            )
+
+        fmap.add_child(GoogleMapsBaseLayer())
 
     if show_zones and map_result is not None:
         grid = map_result["grid"]
@@ -796,7 +874,10 @@ with right_info:
         st.write(f"경도: `{clicked['lng']:.6f}`")
         if st.button("선택 지점을 새 분석 중심으로 검색", use_container_width=True):
             try:
-                addr = reverse_geocode(round(clicked["lat"], 6), round(clicked["lng"], 6), API_KEY)
+                try:
+                    addr = reverse_geocode(round(clicked["lat"], 6), round(clicked["lng"], 6), API_KEY)
+                except Exception:
+                    addr = None  # 역지오코딩은 선택 기능이므로 실패해도 시설 수집을 계속한다.
                 facilities, errors = collect_facilities(
                     clicked["lat"], clicked["lng"], int(center["radius_km"] * 1000),
                     list(ss.get("search_types", list(FACILITY_TYPES))), API_KEY,
@@ -808,7 +889,7 @@ with right_info:
                 else:
                     ss["center"] = {
                         "lat": clicked["lat"], "lng": clicked["lng"],
-                        "label": addr or "지도에서 선택한 위치", "address": addr or "",
+                        "label": addr or f"지도 선택 ({clicked['lat']:.5f}, {clicked['lng']:.5f})", "address": addr or "",
                         "radius_km": center["radius_km"],
                     }
                     ss["base_facilities"] = facilities
