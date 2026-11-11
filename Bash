@@ -1,3 +1,1 @@
-pip install streamlit streamlit-folium folium googlemaps python-dotenv numpy pandas plotly
-# .env 에 GOOGLE_MAPS_API_KEY=AIza... 작성 (또는 .streamlit/secrets.toml)
-streamlit run app.py
+pip install streamlit streamlit-folium folium branca requests python-dotenv numpy pandas plotly
