@@ -1,1 +1,2 @@
 pip install streamlit streamlit-folium folium branca requests python-dotenv numpy pandas plotly
+streamlit run app.py
